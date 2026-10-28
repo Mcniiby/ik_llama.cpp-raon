@@ -90,6 +90,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_GLM_DSA,         "glm-dsa"      },
     { LLM_ARCH_GLM5NEXT,        "glm5next"     },
     { LLM_ARCH_GLM5NEXT_DASHED, "glm5-next"    },
+    { LLM_ARCH_RAON1,           "raon1"        },
     { LLM_ARCH_MISTRAL4,        "mistral4"     },
     { LLM_ARCH_GEMMA4,          "gemma4"       },
     { LLM_ARCH_GEMMA4_MTP,      "gemma4_mtp"   },
@@ -234,6 +235,10 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, "%s.hyper_connection.sinkhorn_iterations" },
     { LLM_KV_HYPER_CONNECTION_EPSILON,             "%s.hyper_connection.epsilon"             },
     { LLM_KV_HYPER_CONNECTION_LOW_RANK,            "%s.hyper_connection.low_rank"            },
+    { LLM_KV_HYPER_CONNECTION_MAGNITUDE,           "%s.hyper_connection.magnitude"           },
+    { LLM_KV_ATTENTION_LATENT_NORM_RMS_EPS,        "%s.attention.latent_norm_rms_epsilon"    },
+    { LLM_KV_ACTIVATION_SITU_BETA,                 "%s.activation.situ_beta"                 },
+    { LLM_KV_ACTIVATION_SITU_LINEAR_BETA,          "%s.activation.situ_linear_beta"          },
 
     { LLM_KV_PLE_LAYERS,                       "%s.ple.layers"                      },
     { LLM_KV_PLE_NGRAM_SIZE,                   "%s.ple.ngram_size"                  },
@@ -382,6 +387,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
     case LLM_ARCH_OPENPANGU:
     case LLM_ARCH_BAILINGMOE3:
     case LLM_ARCH_GLM5NEXT:
+    case LLM_ARCH_RAON1:
     case LLM_ARCH_LFM2:
     case LLM_ARCH_LFM2MOE:
         return true;

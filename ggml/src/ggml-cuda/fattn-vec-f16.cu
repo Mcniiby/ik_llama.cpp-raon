@@ -1,5 +1,6 @@
 #include "fattn-vec-f16.cuh"
 #include "fattn-vec-f16-interface.cuh"
+#include "devquants.cuh"
 
 #define FATTN_VEC_F16_CASE(D, type_K, type_V)                               \
     if (Q->ne[0] == (D) && K->type == (type_K) && V->type == (type_V)) {    \
@@ -80,25 +81,51 @@ void ggml_cuda_flash_attn_ext_vec_f16(ggml_backend_cuda_context & ctx, ggml_tens
     FATTN_VEC_F16_CASE_DKDV(192, 128, GGML_TYPE_F16, GGML_TYPE_F16)
     FATTN_VEC_F16_CASE_DKDV(192, 128, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
 #else
+#if GGML_CUDA_DEVQ_KV_ON(Q4_0) && GGML_CUDA_DEVQ_KV_ON(Q4_0)
     FATTN_VEC_F16_CASE(128, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
+#endif
 
+#if GGML_CUDA_DEVQ_KV_ON(Q8_0) && GGML_CUDA_DEVQ_KV_ON(Q8_0)
     FATTN_VEC_F16_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+#endif
 
+#if GGML_CUDA_DEVQ_KV_ON(F16) && GGML_CUDA_DEVQ_KV_ON(F16)
     FATTN_VEC_F16_CASE( 64, GGML_TYPE_F16, GGML_TYPE_F16)
+#endif
+#if GGML_CUDA_DEVQ_KV_ON(F16) && GGML_CUDA_DEVQ_KV_ON(F16)
     FATTN_VEC_F16_CASE(128, GGML_TYPE_F16, GGML_TYPE_F16)
+#endif
+#if GGML_CUDA_DEVQ_KV_ON(F16) && GGML_CUDA_DEVQ_KV_ON(F16)
     FATTN_VEC_F16_CASE(256, GGML_TYPE_F16, GGML_TYPE_F16)
+#endif
+#if GGML_CUDA_DEVQ_KV_ON(Q8_0) && GGML_CUDA_DEVQ_KV_ON(Q8_0)
     FATTN_VEC_F16_CASE(256, GGML_TYPE_Q8_0,GGML_TYPE_Q8_0)
+#endif
 
+#if GGML_CUDA_DEVQ_KV_ON(IQ4_NL) && GGML_CUDA_DEVQ_KV_ON(IQ4_NL)
     FATTN_VEC_F16_CASE(128, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL)
+#endif
+#if GGML_CUDA_DEVQ_KV_ON(Q8_0) && GGML_CUDA_DEVQ_KV_ON(IQ4_NL)
     FATTN_VEC_F16_CASE(128, GGML_TYPE_Q8_0,   GGML_TYPE_IQ4_NL)
+#endif
+#if GGML_CUDA_DEVQ_KV_ON(Q6_0) && GGML_CUDA_DEVQ_KV_ON(Q5_0)
     FATTN_VEC_F16_CASE(128, GGML_TYPE_Q6_0,   GGML_TYPE_Q5_0)
+#endif
+#if GGML_CUDA_DEVQ_KV_ON(Q8_0) && GGML_CUDA_DEVQ_KV_ON(Q6_0)
     FATTN_VEC_F16_CASE(128, GGML_TYPE_Q8_0,   GGML_TYPE_Q6_0)
+#endif
 
+#if GGML_CUDA_DEVQ_KV_ON(F16) && GGML_CUDA_DEVQ_KV_ON(F16)
     FATTN_VEC_F16_CASE_DKDV(192, 128, GGML_TYPE_F16, GGML_TYPE_F16)
+#endif
+#if GGML_CUDA_DEVQ_KV_ON(Q8_0) && GGML_CUDA_DEVQ_KV_ON(Q8_0)
     FATTN_VEC_F16_CASE_DKDV(192, 128, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+#endif
 
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
+    ggml_cuda_devq_check_kv_type(K->type);
+    ggml_cuda_devq_check_kv_type(V->type);
     on_no_fattn_vec_case(Q->ne[0], V->ne[0]);
 }
 

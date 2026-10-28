@@ -1105,6 +1105,8 @@ struct common_speculative {
     bool last_step_target_only = false;
     float draft_temperature = 0.0f;
     uint32_t draft_seed = LLAMA_DEFAULT_SEED;
+    std::unique_ptr<common_spec_auto_ctl> autoctl;  // DFlash acceptance-gated draft length, null when off
+    int auto_last_drafted = -1;
 };
 
 static bool common_speculative_stage_chain_matches(
@@ -1419,6 +1421,9 @@ common_speculative * common_speculative_init(
 
     if (!configs.empty() && common_speculative_needs_checkpoint(target_model)) {
         const int ckpt_tokens = std::max(1, params.get_max_stage_n_max() + 1);
+        if (params.spec_ckpt_replay) {
+            llama_spec_ckpt_set_replay(ctx_tgt, true);
+        }
         const int actual_mode = llama_spec_ckpt_init(ctx_tgt, spec_ckpt, params.spec_ckpt_mode, ckpt_tokens);
         if (actual_mode == LLAMA_SPEC_CKPT_NONE) {
             LOG_ERR("%s: failed to prepare speculative checkpoint mode '%s' during speculative init (max_tokens=%d)\n",
@@ -1552,6 +1557,37 @@ common_speculative * common_speculative_init(
     };
     common_speculative_prepare_request(result, params);
 
+    // DFlash acceptance-gated draft length: dflash:auto=1 (or LLAMA_DFLASH_AUTO=1), not with --spec-autotune
+    for (size_t i = 0; i < result->configs.size(); ++i) {
+        const auto & stage = result->configs[i].stage;
+        if (result->configs[i].type != COMMON_SPECULATIVE_TYPE_DFLASH) {
+            continue;
+        }
+        const char * env = getenv("LLAMA_DFLASH_AUTO");
+        const bool want = stage.auto_draft >= 0 ? stage.auto_draft == 1 : (env != nullptr && atoi(env) != 0);
+        if (!want) {
+            break;
+        }
+        if (params.autotune) {
+            LOG_WRN("%s: dflash auto draft length is ignored with --spec-autotune\n", __func__);
+            break;
+        }
+        const int cap = stage.has_n_max_override() ? stage.n_max : result->configs[i].params.n_max;
+        result->autoctl = std::make_unique<common_spec_auto_ctl>();
+        result->autoctl->enabled = true;
+        if (stage.auto_gain > 0.0f) {
+            result->autoctl->min_gain = stage.auto_gain;
+        }
+        if (stage.auto_cooldown > 0) {
+            result->autoctl->cooldown_base = stage.auto_cooldown;
+            result->autoctl->cooldown_max = std::max(result->autoctl->cooldown_max, stage.auto_cooldown);
+        }
+        result->autoctl->init(std::max(1, cap));
+        LOG_INF("%s: dflash auto draft length on (n_max cap %d, min gain %.2f, cooldown %d)\n", __func__,
+                result->autoctl->n_cap, result->autoctl->min_gain, result->autoctl->cooldown_base);
+        break;
+    }
+
     // initialize autotune if requested
     if (params.autotune && params.has_composite_stage_chain()) {
         LOG_WRN("Autotune disabled — explicit speculative stage chains are not supported yet\n");
@@ -1574,11 +1610,29 @@ common_speculative * common_speculative_init(
     return result;
 }
 
+static void common_speculative_log_auto(const common_speculative * spec) {
+    if (!spec || !spec->autoctl) {
+        return;
+    }
+    const auto & a = *spec->autoctl;
+    std::string p_str;
+    for (int i = 0; i < a.n_cap; ++i) {
+        p_str += (i ? " " : "") + std::to_string(a.p[i]).substr(0, 4);
+    }
+    LOG_INF("dflash auto: steps on %llu off %llu, switch-offs %llu, explore %llu, last pick %d, gain %.3f, "
+            "accepted/step %.2f, t_plain %.2f ms, t(pick) %.2f ms, p_cond [%s]\n",
+            (unsigned long long) a.n_on_steps, (unsigned long long) a.n_off_steps,
+            (unsigned long long) a.n_switch_off, (unsigned long long) a.n_explore,
+            a.last_pick, a.last_gain, a.acc_ema, a.t[0] / 1000.0,
+            a.last_pick > 0 ? a.step_time(a.last_pick) / 1000.0 : 0.0, p_str.c_str());
+}
+
 void common_speculative_free(common_speculative * spec) {
     if (spec == nullptr) {
         return;
     }
 
+    common_speculative_log_auto(spec);
     spec->checkpoint.clear();
     delete spec;
 }
@@ -1612,6 +1666,10 @@ llama_tokens common_speculative_draft(
         spec->tuner->propose(params);
     }
 
+    // 0 = target-only step this round
+    const int auto_n = spec->autoctl ? spec->autoctl->decide() : -1;
+    spec->auto_last_drafted = -1;
+
     const auto runtime_stages = params.get_resolved_stages();
     const bool use_runtime_stage_overrides = common_speculative_stage_chain_matches(runtime_stages, spec->configs);
 
@@ -1636,6 +1694,18 @@ llama_tokens common_speculative_draft(
             break;
         }
 
+        if (auto_n >= 0 && impl->type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            if (auto_n == 0) {
+                // a root-only target step keeps the DFlash feature window fed
+                spec->curr_impl = impl.get();
+                spec->last_step_target_only = true;
+                spec->auto_last_drafted = 0;
+                LOG_DBG("%s: dflash auto: target-only step (gain %.3f)\n", __func__, spec->autoctl->last_gain);
+                break;
+            }
+            impl_params.n_max = std::min(impl_params.n_max, auto_n);
+        }
+
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(impl_params, prompt_tgt, id_last, draft_base_pos, draft_seq_id, result);
@@ -1657,6 +1727,9 @@ llama_tokens common_speculative_draft(
                 impl.get()->n_call_draft, result.size());
 
         spec->curr_impl = impl.get();
+        if (auto_n > 0 && impl->type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            spec->auto_last_drafted = (int) result.size();
+        }
         impl->n_gen_drafts++;
         impl->n_gen_tokens += result.size();
         impl->drafted_by_position.resize(std::max(impl->drafted_by_position.size(), result.size()));
@@ -1677,6 +1750,12 @@ llama_tokens common_speculative_draft(
 }
 
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
+    if (spec->autoctl && spec->auto_last_drafted >= 0 && spec->t_step_start_us > 0) {
+        // step = draft + verify + sampling
+        const double step_us = (double) (ggml_time_us() - spec->t_step_start_us);
+        spec->autoctl->observe(spec->auto_last_drafted, n_accepted, step_us);
+        spec->auto_last_drafted = -1;
+    }
     if (spec->tuner && spec->tuner->enabled && spec->t_step_start_us > 0) {
         int64_t step_time_us = ggml_time_us() - spec->t_step_start_us;
         double step_tps = (step_time_us > 100)
@@ -2887,6 +2966,8 @@ void common_speculative_print_stats(const common_speculative * spec, double slot
                 str_perf.c_str());
 
     }
+
+    common_speculative_log_auto(spec);
 
     if (spec->tuner && spec->tuner->enabled && slot_tps > 0.0 && n_decoded > 0) {
         auto * mutable_spec = const_cast<common_speculative *>(spec);

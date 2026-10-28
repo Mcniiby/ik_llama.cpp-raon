@@ -168,6 +168,13 @@ struct llama_hparams {
     float    dsv4_hc_eps             = 0.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios = {};
 
+    // Raon-1
+    float    hc_magnitude          = 0.0f; // scale of the mHC post weights
+    float    f_norm_rms_eps_latent = 0.0f; // MLA q/kv latent RMSNorm eps
+    float    situ_beta             = 0.0f; // SiTU: beta*tanh(g/beta)*sigmoid(g) * lb*tanh(u/lb)
+    float    situ_linear_beta      = 0.0f;
+    uint32_t ssm_f_rank            = 0;    // RDA decay-gate low rank (f_a output width)
+
     // The two compressed-stream plan slots. V4 hardcodes 4 (overlapping groups) and 128;
     // V4.1 takes both ratios from the file and pools disjoint groups in both.
     uint32_t dsv4_csa_ratio   = 4;

@@ -333,7 +333,46 @@ void quantize_mmq_q8_1_id_cuda(
 }
 
 
+// rows r = i2*ne1 + i1 of a [ne0, ne1, ne2] tensor with any row/channel strides, padded like the contiguous case
+static __global__ void quantize_q8_1_2d(const float * __restrict__ x, void * __restrict__ vy, const int64_t kx, const int64_t kx0_padded,
+        const int64_t ne1, const uint64_t s1, const uint64_t s2) {
+    const int64_t ix0 = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+    if (ix0 >= kx0_padded) {
+        return;
+    }
+    const int64_t ix1 = blockIdx.y;
+    const int64_t i_padded = ix1*kx0_padded + ix0;
+    block_q8_1 * y = (block_q8_1 *) vy;
+    const int64_t ib = i_padded / QK8_1;
+    const int64_t iqs = i_padded % QK8_1;
+    const float xi = ix0 < kx ? x[(ix1 % ne1)*s1 + (ix1 / ne1)*s2 + ix0] : 0.0f;
+    float amax = fabsf(xi);
+    float sum = xi;
+    amax = warp_reduce_max(amax);
+    sum = warp_reduce_sum(sum);
+    const float d = amax / 127;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    y[ib].qs[iqs] = q;
+    if (iqs > 0) {
+        return;
+    }
+    reinterpret_cast<half&>(y[ib].ds.x) = d;
+    reinterpret_cast<half&>(y[ib].ds.y) = sum;
+}
+
 void quantize_tensor_q8_1_cuda(const struct ggml_tensor * src, void * vy, const enum ggml_type type, cudaStream_t stream) {
+    GGML_ASSERT(src->ne[3] == 1 && src->nb[0] == sizeof(float));
+    if (src->ne[1] > 1) {
+        // a few columns per channel: rows in [ne1][ne2] order, as the contiguous quantizer
+        GGML_ASSERT(src->type == GGML_TYPE_F32);
+        const int64_t padded = GGML_PAD(src->ne[0], MATRIX_ROW_PADDING);
+        const int64_t block_num_x = (padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
+        const dim3 num_blocks(block_num_x, src->ne[1]*src->ne[2], 1);
+        quantize_q8_1_2d<<<num_blocks, dim3(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1), 0, stream>>>((const float *)src->data, vy, src->ne[0], padded,
+                src->ne[1], src->nb[1]/sizeof(float), src->nb[2]/sizeof(float));
+        GGML_UNUSED(type);
+        return;
+    }
     GGML_ASSERT(src->ne[1] == 1 && src->ne[3] == 1);
     GGML_ASSERT(src->type == GGML_TYPE_F32);
     const int64_t src_padded_col_size = GGML_PAD(src->ne[0], MATRIX_ROW_PADDING);

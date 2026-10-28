@@ -132,6 +132,13 @@ set   (GGML_CUDA_MIN_BATCH_OFFLOAD "32" CACHE STRING
 option(GGML_CUDA_NO_PEER_COPY               "ggml: do not use peer to peer copies"            OFF)
 option(GGML_CUDA_NO_VMM                     "ggml: do not try to use CUDA VMM"                OFF)
 option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
+# dev-only: build CUDA MMQ/MMVQ/FA-vec kernels only for the listed types; other types abort
+option(GGML_CUDA_DEV_QUANTS                 "ggml: (dev) compile CUDA quant kernels only for GGML_CUDA_DEV_QUANTS_TYPES" OFF)
+set   (GGML_CUDA_DEV_QUANTS_TYPES
+       "F32;F16;BF16;Q8_0;Q6_K;Q5_K;Q4_K;Q5_0;IQ4_NL;IQ4_XS;IQ3_S;IQ3_KS;IQ4_KS;IQ4_KS_R16"
+       CACHE STRING                         "ggml: (dev) weight types kept when GGML_CUDA_DEV_QUANTS=ON (ggml_type names without GGML_TYPE_)")
+set   (GGML_CUDA_DEV_QUANTS_KV_TYPES "F16;Q8_0" CACHE STRING
+                                            "ggml: (dev) KV-cache types kept for FA vec kernels when GGML_CUDA_DEV_QUANTS=ON")
 option(GGML_CUDA_USE_GRAPHS                 "ggml: use CUDA graphs (llama.cpp only)"          ON)
 set   (GGML_CUDA_FUSION  "1" CACHE STRING   "ggml: enable/disable fusion")
 set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING

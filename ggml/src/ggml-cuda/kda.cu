@@ -2,6 +2,7 @@
 #include "kda.cuh"
 
 #include <cstdint>
+#include <cstdlib>
 
 __device__ __forceinline__ float sigmoid_f(float x) {
     return 1.0f / (1.0f + expf(-x));
@@ -177,6 +178,120 @@ __global__ void kda_recurrent_f32(
     }
 }
 
+// RAON_KDA_FAST (default 1): barrier-free variant of kda_recurrent_f32 for head dim 128 / 64, after llama.cpp's
+// gated_delta_net_cuda (MIT). Each lane keeps part of a state row in registers, so row sums are 4-lane shuffle
+// reductions. Same per-element arithmetic order as kda_recurrent_f32. RAON_KDA_FAST=0: the block kernel above.
+template <int HEAD_DIM>
+__launch_bounds__(64)
+__global__ void kda_recurrent_fast_f32(
+    const float * __restrict__ q,
+    const float * __restrict__ k,
+    const float * __restrict__ v,
+    const float * __restrict__ g,
+    const float * __restrict__ beta_in,
+    const float * state_in,
+    float * __restrict__ dst,
+    float * state_out,
+    float * __restrict__ saved_states,
+    const int32_t n_heads,
+    const int32_t gqa_ratio,
+    const int32_t repeat_type,
+    const int32_t n_tokens,
+    const int32_t n_seqs,
+    size_t vnb1, size_t vnb2, size_t vnb3,
+    size_t gnb0, size_t gnb1, size_t gnb2, size_t gnb3,
+    size_t bnb1, size_t bnb2, size_t bnb3) {
+    constexpr int32_t SPL       = HEAD_DIM/4;
+    constexpr int32_t CTA_PER_H = HEAD_DIM/16;
+
+    const int32_t batch_idx   = blockIdx.y;
+    const int32_t head_idx    = blockIdx.x / CTA_PER_H;
+    const int32_t sub         = blockIdx.x % CTA_PER_H;
+    const int32_t head_idx_kq = repeat_type == 0 ? head_idx / gqa_ratio : head_idx % (n_heads/gqa_ratio);
+    const int32_t warp = threadIdx.x / WARP_SIZE;
+    const int32_t lane = threadIdx.x % WARP_SIZE;
+    const int32_t rl   = lane % 8;
+    const int32_t kg   = lane / 8;
+    const int32_t rr   = sub*16 + warp*8 + rl;
+    const int32_t c0   = kg*SPL;
+
+    const int64_t qkv_stride_head     = (int64_t) HEAD_DIM * n_tokens;
+    const int64_t qkv_stride_batch_kq = (int64_t) HEAD_DIM * n_tokens * (n_heads/gqa_ratio);
+    const int64_t state_head_offset   = (int64_t) head_idx * HEAD_DIM * HEAD_DIM;
+    const int64_t state_batch_stride  = (int64_t) HEAD_DIM * HEAD_DIM * n_heads;
+    const int64_t state_step_stride   = state_batch_stride * n_seqs;
+
+    const float * q_ptr    = q + batch_idx * qkv_stride_batch_kq + head_idx_kq * qkv_stride_head + c0;
+    const float * k_ptr    = k + batch_idx * qkv_stride_batch_kq + head_idx_kq * qkv_stride_head + c0;
+    const float * v_ptr    = v + batch_idx * vnb3 + head_idx * vnb2;
+    const float * g_ptr    = g + batch_idx * gnb3 + head_idx * gnb2 + c0 * gnb1;
+    const float * beta_ptr = beta_in + batch_idx * bnb3 + head_idx * bnb2;
+    const float * state_src = state_in + batch_idx * state_batch_stride + state_head_offset;
+    float * state_dst  = state_out + batch_idx * state_batch_stride + state_head_offset;
+    float * out_base   = dst + (int64_t) batch_idx * (HEAD_DIM * n_heads * n_tokens) + head_idx * HEAD_DIM;
+    const int64_t out_token_stride = (int64_t) HEAD_DIM * n_heads;
+
+    const float scale = rsqrtf((float) HEAD_DIM);
+
+    float st[SPL];
+#pragma unroll
+    for (int32_t i = 0; i < SPL; ++i) {
+        st[i] = state_src[(int64_t) (c0 + i)*HEAD_DIM + rr];
+    }
+
+    for (int32_t t = 0; t < n_tokens; ++t) {
+        const float * qt = q_ptr + t*HEAD_DIM;
+        const float * kt = k_ptr + t*HEAD_DIM;
+        const float * gt = g_ptr + t*gnb0;
+        float p1 = 0.0f, p2 = 0.0f, kq = 0.0f;
+#pragma unroll
+        for (int32_t i = 0; i < SPL; ++i) {
+            const float qs = qt[i]*scale;
+            const float kc = kt[i];
+            const float s  = st[i]*expf(fminf(gt[i*gnb1], 50.0f));
+            st[i] = s;
+            p1 += s*kc;
+            p2 += s*qs;
+            kq += kc*qs;
+        }
+        p1 += __shfl_xor_sync(0xffffffff, p1, 8);
+        p2 += __shfl_xor_sync(0xffffffff, p2, 8);
+        kq += __shfl_xor_sync(0xffffffff, kq, 8);
+        p1 += __shfl_xor_sync(0xffffffff, p1, 16);
+        p2 += __shfl_xor_sync(0xffffffff, p2, 16);
+        kq += __shfl_xor_sync(0xffffffff, kq, 16);
+
+        const float beta_val = sigmoid_f(beta_ptr[t*bnb1]);
+        const float v_new = beta_val * (v_ptr[t*vnb1 + rr] - p1);
+        if (kg == 0) {
+            out_base[t*out_token_stride + rr] = p2 + v_new*kq;
+        }
+#pragma unroll
+        for (int32_t i = 0; i < SPL; ++i) {
+            st[i] = fminf(fmaxf(st[i] + v_new*kt[i], -1e6f), 1e6f);
+        }
+        if (saved_states && t < n_tokens - 1) {
+            float * step_dst = saved_states + batch_idx * state_batch_stride + state_head_offset + t * state_step_stride;
+#pragma unroll
+            for (int32_t i = 0; i < SPL; ++i) {
+                step_dst[(int64_t) (c0 + i)*HEAD_DIM + rr] = st[i];
+            }
+        }
+    }
+#pragma unroll
+    for (int32_t i = 0; i < SPL; ++i) {
+        state_dst[(int64_t) (c0 + i)*HEAD_DIM + rr] = st[i];
+    }
+}
+
+static bool kda_fast_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("RAON_KDA_FAST");
+        return !e || atoi(e) != 0;
+    }();
+    return on;
+}
+
 static void kda_f32_cuda(
     const float * q,
     const float * k,
@@ -199,6 +314,21 @@ static void kda_f32_cuda(
     cudaStream_t stream) {
     if (head_dim != 64 && head_dim != 128) {
         GGML_ABORT("Unsupported KDA head size");
+    }
+
+    if (kda_fast_enabled()) {
+        const dim3 grid(n_heads * (head_dim/16), n_seqs, 1);
+        if (head_dim == 64) {
+            kda_recurrent_fast_f32<64><<<grid, 64, 0, stream>>>(
+                    q, k, v, g, beta, state_in, dst, state_out, saved_states, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs,
+                    vnb1, vnb2, vnb3, gnb0, gnb1, gnb2, gnb3, bnb1, bnb2, bnb3);
+        } else {
+            kda_recurrent_fast_f32<128><<<grid, 64, 0, stream>>>(
+                    q, k, v, g, beta, state_in, dst, state_out, saved_states, n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs,
+                    vnb1, vnb2, vnb3, gnb0, gnb1, gnb2, gnb3, bnb1, bnb2, bnb3);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
     }
 
     const int32_t num_blocks = n_seqs * n_heads * (head_dim/WARP_SIZE);

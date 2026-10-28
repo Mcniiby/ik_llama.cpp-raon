@@ -1,5 +1,6 @@
 #include "mmq_id_common.cuh"
 #include "mmq_id.cuh"
+#include "devquants.cuh"
 #include "quantize_id.cuh"
 #include "quantize.cuh"
 
@@ -143,139 +144,233 @@ static void launch_mmq_ids_helper(
 
 static void ggml_cuda_mul_mat_q_switch_type_id(ggml_backend_cuda_context & ctx, const mmq_args_id & args, cudaStream_t stream) {
     switch (args.type_x) {
+#if GGML_CUDA_DEVQ_ON(Q4_0)
         case GGML_TYPE_Q4_0:
             mul_mat_q_case_id<GGML_TYPE_Q4_0>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(Q4_1)
         case GGML_TYPE_Q4_1:
             mul_mat_q_case_id<GGML_TYPE_Q4_1>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(Q5_0)
         case GGML_TYPE_Q5_0:
             mul_mat_q_case_id<GGML_TYPE_Q5_0>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(Q5_1)
         case GGML_TYPE_Q5_1:
             mul_mat_q_case_id<GGML_TYPE_Q5_1>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(Q6_0)
         case GGML_TYPE_Q6_0:
             mul_mat_q_case_id<GGML_TYPE_Q6_0>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(Q8_0)
         case GGML_TYPE_Q8_0:
             mul_mat_q_case_id<GGML_TYPE_Q8_0>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(MXFP4)
         case GGML_TYPE_MXFP4:
             mul_mat_q_case_id<GGML_TYPE_MXFP4>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(Q2_K)
         case GGML_TYPE_Q2_K:
             mul_mat_q_case_id<GGML_TYPE_Q2_K>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(Q3_K)
         case GGML_TYPE_Q3_K:
             mul_mat_q_case_id<GGML_TYPE_Q3_K>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(Q4_K)
         case GGML_TYPE_Q4_K:
             mul_mat_q_case_id<GGML_TYPE_Q4_K>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(Q5_K)
         case GGML_TYPE_Q5_K:
             mul_mat_q_case_id<GGML_TYPE_Q5_K>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(Q6_K)
         case GGML_TYPE_Q6_K:
             mul_mat_q_case_id<GGML_TYPE_Q6_K>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ2_XXS)
         case GGML_TYPE_IQ2_XXS:
             mul_mat_q_case_id<GGML_TYPE_IQ2_XXS>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ2_XS)
         case GGML_TYPE_IQ2_XS:
             mul_mat_q_case_id<GGML_TYPE_IQ2_XS>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ2_S)
         case GGML_TYPE_IQ2_S:
             mul_mat_q_case_id<GGML_TYPE_IQ2_S>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ3_XXS)
         case GGML_TYPE_IQ3_XXS:
             mul_mat_q_case_id<GGML_TYPE_IQ3_XXS>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ3_S)
         case GGML_TYPE_IQ3_S:
             mul_mat_q_case_id<GGML_TYPE_IQ3_S>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ1_S)
         case GGML_TYPE_IQ1_S:
             mul_mat_q_case_id<GGML_TYPE_IQ1_S>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ1_S_R4)
         case GGML_TYPE_IQ1_S_R4:
             mul_mat_q_case_id<GGML_TYPE_IQ1_S_R4>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ4_XS)
         case GGML_TYPE_IQ4_XS:
             mul_mat_q_case_id<GGML_TYPE_IQ4_XS>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ4_NL)
         case GGML_TYPE_IQ4_NL:
             mul_mat_q_case_id<GGML_TYPE_IQ4_NL>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ2_KS)
         case GGML_TYPE_IQ2_KS:
             mul_mat_q_case_id<GGML_TYPE_IQ2_KS>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ2_KL)
         case GGML_TYPE_IQ2_KL:
             mul_mat_q_case_id<GGML_TYPE_IQ2_KL>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ2_K)
         case GGML_TYPE_IQ2_K:
             mul_mat_q_case_id<GGML_TYPE_IQ2_K>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ2_K_R4)
         case GGML_TYPE_IQ2_K_R4:
             mul_mat_q_case_id<GGML_TYPE_IQ2_K_R4>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ3_K)
         case GGML_TYPE_IQ3_K:
             mul_mat_q_case_id<GGML_TYPE_IQ3_K>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ3_K_R4)
         case GGML_TYPE_IQ3_K_R4:
             mul_mat_q_case_id<GGML_TYPE_IQ3_K_R4>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ3_KS)
         case GGML_TYPE_IQ3_KS:
             mul_mat_q_case_id<GGML_TYPE_IQ3_KS>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ4_KSS)
         case GGML_TYPE_IQ4_KSS:
             mul_mat_q_case_id<GGML_TYPE_IQ4_KSS>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ4_KS)
         case GGML_TYPE_IQ4_KS:
             mul_mat_q_case_id<GGML_TYPE_IQ4_KS>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ4_KS_R4)
         case GGML_TYPE_IQ4_KS_R4:
             mul_mat_q_case_id<GGML_TYPE_IQ4_KS_R4>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ3_KS_R16)
+        case GGML_TYPE_IQ3_KS_R16:
+            mul_mat_q_case_id<GGML_TYPE_IQ3_KS_R16>(ctx, args, stream);
+            break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ4_KS_R16)
         case GGML_TYPE_IQ4_KS_R16:
             mul_mat_q_case_id<GGML_TYPE_IQ4_KS_R16>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ4_K)
         case GGML_TYPE_IQ4_K:
             mul_mat_q_case_id<GGML_TYPE_IQ4_K>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ4_K_R4)
         case GGML_TYPE_IQ4_K_R4:
             mul_mat_q_case_id<GGML_TYPE_IQ4_K_R4>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ5_KS)
         case GGML_TYPE_IQ5_KS:
             mul_mat_q_case_id<GGML_TYPE_IQ5_KS>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ5_KS_R4)
         case GGML_TYPE_IQ5_KS_R4:
             mul_mat_q_case_id<GGML_TYPE_IQ5_KS_R4>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ5_K)
         case GGML_TYPE_IQ5_K:
             mul_mat_q_case_id<GGML_TYPE_IQ5_K>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ5_K_R4)
         case GGML_TYPE_IQ5_K_R4:
             mul_mat_q_case_id<GGML_TYPE_IQ5_K_R4>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ5_KS_R16)
         case GGML_TYPE_IQ5_KS_R16:
             mul_mat_q_case_id<GGML_TYPE_IQ5_KS_R16>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ6_K)
         case GGML_TYPE_IQ6_K:
             mul_mat_q_case_id<GGML_TYPE_IQ6_K>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ1_KT)
         case GGML_TYPE_IQ1_KT:
             mul_mat_q_case_id<GGML_TYPE_IQ1_KT>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ2_KT)
         case GGML_TYPE_IQ2_KT:
             mul_mat_q_case_id<GGML_TYPE_IQ2_KT>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ3_KT)
         case GGML_TYPE_IQ3_KT:
             mul_mat_q_case_id<GGML_TYPE_IQ3_KT>(ctx, args, stream);
             break;
+#endif
+#if GGML_CUDA_DEVQ_ON(IQ4_KT)
         case GGML_TYPE_IQ4_KT:
             mul_mat_q_case_id<GGML_TYPE_IQ4_KT>(ctx, args, stream);
             break;
+#endif
         default:
+            ggml_cuda_devq_check_type(args.type_x);
             GGML_ABORT("fatal error");
             break;
     }
@@ -539,6 +634,7 @@ bool ggml_cuda_can_use_mmq_id(enum ggml_type type, int cc, int64_t ne11) {
         case GGML_TYPE_IQ4_KSS:
         case GGML_TYPE_IQ4_KS:
         case GGML_TYPE_IQ4_KS_R4:
+        case GGML_TYPE_IQ3_KS_R16:
         case GGML_TYPE_IQ4_KS_R16:
         case GGML_TYPE_IQ4_K:
         case GGML_TYPE_IQ4_K_R4:

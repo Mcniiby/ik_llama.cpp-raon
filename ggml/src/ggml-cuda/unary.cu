@@ -151,6 +151,29 @@ static __global__ void fused_mul_silu_f32(const float * x, float * dst, const in
     dst[i] = max(-limit, min(limit, x_row[j + ne0])) * g;
 }
 
+// SiTU, x = gate, y = up
+static __global__ void fused_mul_situ_f32(const float * x, const float * y, float * dst, const int k, const float beta, const float lb) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+    dst[i] = ggml_cuda_situ(x[i], y[i], beta, lb);
+}
+
+// SiTU, merged rows: gate at the beginning of each row, up offset by ne0
+static __global__ void fused_mul_situ_f32(const float * x, float * dst, const int k, const int ne0, const float beta, const float lb) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+    int row = i / ne0;
+    int j   = i % ne0;
+    auto x_row = x + 2*row*ne0;
+    dst[i] = ggml_cuda_situ(x_row[j], x_row[j + ne0], beta, lb);
+}
+
 static __global__ void fused_mul_relu_f32(const float * x, const float * y, float * dst, const int k) {
     const int i = blockDim.x*blockIdx.x + threadIdx.x;
 
@@ -468,11 +491,15 @@ void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #endif
 
 void ggml_fused_mul_unary(ggml_backend_cuda_context & ctx, ggml_unary_op op,
-        int64_t nelements, const float * src0_d, const float * src1_d, float * dst_d, float limit) {
+        int64_t nelements, const float * src0_d, const float * src1_d, float * dst_d, float limit, float limit2) {
 
     cudaStream_t stream = ctx.stream();
 
     switch (op) {
+        case GGML_UNARY_OP_SITU: {
+            const int num_blocks = (nelements + CUDA_SILU_BLOCK_SIZE - 1) / CUDA_SILU_BLOCK_SIZE;
+            fused_mul_situ_f32<<<num_blocks, CUDA_SILU_BLOCK_SIZE, 0, stream>>>(src0_d, src1_d, dst_d, nelements, limit, limit2);
+        } break;
         case GGML_UNARY_OP_SILU: fused_mul_silu_f32_cuda(src0_d, src1_d, dst_d, nelements, limit, stream); break;
         case GGML_UNARY_OP_RELU: fused_mul_relu_f32_cuda(src0_d, src1_d, dst_d, nelements, stream); break;
         case GGML_UNARY_OP_GELU: fused_mul_gelu_f32_cuda(src0_d, src1_d, dst_d, nelements, stream); break;
@@ -482,11 +509,15 @@ void ggml_fused_mul_unary(ggml_backend_cuda_context & ctx, ggml_unary_op op,
 }
 
 void ggml_fused_mul_unary(ggml_backend_cuda_context & ctx, ggml_unary_op op,
-        int64_t nelements, int64_t ne0, const float * src0_d, float * dst_d, float limit) {
+        int64_t nelements, int64_t ne0, const float * src0_d, float * dst_d, float limit, float limit2) {
 
     cudaStream_t stream = ctx.stream();
 
     switch (op) {
+        case GGML_UNARY_OP_SITU: {
+            const int num_blocks = (nelements + CUDA_SILU_BLOCK_SIZE - 1) / CUDA_SILU_BLOCK_SIZE;
+            fused_mul_situ_f32<<<num_blocks, CUDA_SILU_BLOCK_SIZE, 0, stream>>>(src0_d, dst_d, nelements, ne0, limit, limit2);
+        } break;
         case GGML_UNARY_OP_SILU: fused_mul_silu_f32_cuda(src0_d, dst_d, nelements, ne0, limit, stream); break;
         case GGML_UNARY_OP_RELU: fused_mul_relu_f32_cuda(src0_d, dst_d, nelements, ne0, stream); break;
         case GGML_UNARY_OP_GELU: fused_mul_gelu_f32_cuda(src0_d, dst_d, nelements, ne0, stream); break;
@@ -499,6 +530,7 @@ void ggml_cuda_op_fused_mul_unary(ggml_backend_cuda_context & ctx, ggml_tensor *
     const ggml_tensor * src1 = dst->src[1];
     ggml_unary_op op = (ggml_unary_op)dst->op_params[0];
     float limit = *(const float *)(dst->op_params + 1);
+    float limit2 = *(const float *)(dst->op_params + 2); // SiTU linear beta
     GGML_ASSERT(ggml_is_contiguous(src0));
 
     if (src1) {
@@ -518,10 +550,10 @@ void ggml_cuda_op_fused_mul_unary(ggml_backend_cuda_context & ctx, ggml_tensor *
             return;
         }
         GGML_ASSERT(ggml_are_same_shape(src0, src1));
-        ggml_fused_mul_unary(ctx, op, ggml_nelements(dst), (const float *)src0->data, (const float *)src1->data, (float *)dst->data, limit);
+        ggml_fused_mul_unary(ctx, op, ggml_nelements(dst), (const float *)src0->data, (const float *)src1->data, (float *)dst->data, limit, limit2);
     } else {
         GGML_ASSERT(src0->ne[0] == 2*dst->ne[0] && src0->ne[1] == dst->ne[1] && src0->ne[2] == dst->ne[2] && src0->ne[3] == dst->ne[3]);
-        ggml_fused_mul_unary(ctx, op, ggml_nelements(dst), dst->ne[0], (const float *)src0->data, (float *)dst->data, limit);
+        ggml_fused_mul_unary(ctx, op, ggml_nelements(dst), dst->ne[0], (const float *)src0->data, (float *)dst->data, limit, limit2);
     }
 }
 

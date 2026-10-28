@@ -5,6 +5,10 @@
 #include "llama-sampling.h"
 
 #include "llama-spec-features.h"
+#include "llama-gsample.h"
+#include "llama-spec-replay.h"
+
+#include "ggml-backend.h"
 
 struct llama_model;
 class llama_moe_cache;
@@ -227,6 +231,31 @@ struct llama_kv_cache {
         bool dsv4_shadow_allocated = false;
         bool dsv4_shadow_saved = false;
 
+        // Replay rollback (LLAMA_SPEC_REPLAY=1 or --spec-ckpt-mode replay), see llama-spec-replay.h
+        bool replay_requested = false;          // sticky across re-allocations
+        bool replay_active    = false;          // replay buffers allocated, per_step_ssm left empty
+        std::vector<llama_replay_layer> replay; // per layer, invalid for non-recurrent layers
+        int32_t   replay_pending_n    = 0;      // rows of a verify window whose SSM state is not committed
+        uint32_t  replay_pending_slot = 0;
+        llama_pos replay_pending_pos0 = -1;
+        // commit scratch per backend, shared by all cached commit graphs (commits run in stream order)
+        std::map<ggml_backend_t, ggml_backend_buffer_t> replay_scratch;
+        // cached commit graphs: stable node addresses let CUDA graphs be reused
+        std::map<std::tuple<ggml_backend_t, uint32_t, int32_t, int32_t, bool>, std::pair<ggml_context *, ggml_cgraph *>> replay_graphs;
+        uint64_t replay_n_commits = 0;
+        uint64_t replay_n_rows    = 0;
+
+        void release_replay_graphs() {
+            for (auto & [key, val] : replay_graphs) {
+                ggml_free(val.first);
+            }
+            replay_graphs.clear();
+            for (auto & [backend, buf] : replay_scratch) {
+                ggml_backend_buffer_free(buf);
+            }
+            replay_scratch.clear();
+        }
+
         // Separate storage for per-step allocations
         std::vector<struct ggml_context *>   per_step_ctxs;
         std::vector<ggml_backend_buffer_t>   per_step_bufs;
@@ -242,6 +271,11 @@ struct llama_kv_cache {
         void release_dsv4_snapshot();
 
         void release_per_step() {
+            release_replay_graphs();
+            replay.clear();
+            replay_active = false;
+            replay_pending_n = 0;
+            replay_pending_pos0 = -1;
             for (struct ggml_context * ctx : per_step_ctxs) {
                 ggml_free(ctx);
             }
@@ -305,6 +339,7 @@ struct llama_kv_cache {
     // Per-step checkpoint: allocate, restore step k's full state (SSM + conv) to cache
     bool per_step_alloc(const llama_model & model, int max_tokens);
     bool per_step_restore(ggml_backend_sched_t sched, llama_ckpt_data ckpt_type, int step, uint32_t slot);
+    bool replay_commit(ggml_backend_sched_t sched, int32_t n_rows);
 
     ~llama_kv_cache() {
         for (struct ggml_context * ctx : ctxs) {
@@ -315,6 +350,24 @@ struct llama_kv_cache {
         }
     }
 };
+
+// True when this ubatch is a replay-rollback verify window. Used by both the graph builder and llama_decode
+// so a reused graph and the pending flag agree.
+static inline bool llama_spec_replay_window(const llama_kv_cache & kv, const llama_batch & b, llama_seq_id * seq_out = nullptr) {
+    if (!kv.ckpt.replay_active || !kv.save_per_step_ssm) return false;
+    if (b.n_tokens <= 1 || b.n_tokens > kv.ckpt.per_step_max_allocated) return false;
+    if (b.pos == nullptr || b.pos[0] == 0) return false;
+    llama_seq_id seq = 0;
+    if (b.n_seq_id != nullptr && b.seq_id != nullptr) {
+        seq = b.seq_id[0][0];
+        for (int32_t i = 0; i < b.n_tokens; ++i) {
+            if (b.n_seq_id[i] != 1 || b.seq_id[i][0] != seq) return false;
+        }
+    }
+    if (seq < 0) return false;
+    if (seq_out) *seq_out = seq;
+    return true;
+}
 
 struct llama_control_vector {
     std::vector<struct ggml_tensor *> tensors; // per layer
@@ -400,6 +453,12 @@ struct llama_context {
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_t buf_output = nullptr;
+
+    // pinned staging for trimmed-head logits
+    ggml_backend_buffer_t buf_trim_stage = nullptr;
+
+    // GPU logits candidates (llama-gsample.h)
+    llama_gsample gsample;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     size_t  logits_size = 0; // capacity (of floats) for logits
@@ -533,6 +592,7 @@ struct llama_context {
         bool want_dspark_logits = false;
 
         std::vector<llama_token> draft_tokens;
+        bool draft_tokens_are_rows = false; // filled from the GPU argmax over a trimmed head: map via output_token_ids
         struct ggml_tensor * draft_tokens_tensor = nullptr;
         struct ggml_tensor * draft_lattice_tensor = nullptr;
         struct ggml_tensor * draft_lattice_ids_tensor = nullptr;
@@ -761,6 +821,7 @@ struct llama_context {
 
     void reset_scheduler();
     bool can_reuse_graph(const llama_batch & u_batch, uint64_t seq_fingerprint, uint64_t model_state_hash);
+    bool can_reuse_graph_body(const llama_batch & u_batch, uint64_t seq_fingerprint, uint64_t model_state_hash);
 
     struct CacheCopy {
         ggml_tensor * cpy = nullptr;

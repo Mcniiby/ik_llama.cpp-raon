@@ -4,6 +4,7 @@
 #include "llama-spec-features.h"
 #include "common.h"
 #include "spec-tuner.h"
+#include "spec-dflash-auto.h"
 
 struct common_speculative;
 

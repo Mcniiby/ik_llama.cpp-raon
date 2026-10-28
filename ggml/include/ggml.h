@@ -698,6 +698,7 @@ extern "C" {
         GGML_OP_FILL,
         GGML_OP_SOLVE_TRI,
         GGML_OP_DELTA_NET,
+        GGML_OP_RDA_DECODE,
 
         GGML_OP_MAP_UNARY,
         GGML_OP_MAP_BINARY,
@@ -728,6 +729,9 @@ extern "C" {
         GGML_OP_MASK_TO_IDX,
         GGML_OP_LATENT_ATTN,
         GGML_OP_DS4_COMP,
+        GGML_OP_RAON_HC_PRE,
+        GGML_OP_LOGITS_TOPM,
+        GGML_OP_RAON_MOE_BLOCK,
 
         GGML_OP_COUNT,
     };
@@ -752,6 +756,9 @@ extern "C" {
         GGML_UNARY_OP_EXP,
         GGML_UNARY_OP_SOFTPLUS,
         GGML_UNARY_OP_SQRT_SOFTPLUS,
+        // SiTU gated activation, fused gate/up ops only: beta*tanh(g/beta)*sigmoid(g) * lb*tanh(u/lb)
+        // (u unclamped if lb <= 0). op_params[1] = beta, op_params[2] = lb.
+        GGML_UNARY_OP_SITU,
 
         GGML_UNARY_OP_COUNT,
     };
@@ -2692,6 +2699,36 @@ extern "C" {
             struct ggml_tensor  * state,
             struct ggml_tensor  * saved_steps);
 
+    // RDA small-batch decode step in one op: short conv + SiLU, q/k L2 norm, decay, delta-rule recurrence and
+    // gated RMS norm. Conv and recurrent states live in `state` rows and are updated in place. Group g of n_seqs
+    // runs on state row slots[g] (zeroed first when reset[g]); groups must use distinct slots. Result: [H*S, n_tokens].
+    //   q, k, v, f, z : [H*S, n_tokens] f32 (raw projections; f is the decay projection output)
+    //   conv_q/k/v    : [d_conv, 1, H*S] f32 depthwise conv weights (d_conv == 4)
+    //   beta, rda     : [H, n_tokens] f32 raw erase gate and write-gate delta
+    //   dt_b, a, norm : [H*S], [H], [S] f32
+    GGML_API struct ggml_tensor * ggml_rda_decode(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * conv_q,
+            struct ggml_tensor  * conv_k,
+            struct ggml_tensor  * conv_v,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * rda,
+            struct ggml_tensor  * f,
+            struct ggml_tensor  * dt_b,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * z,
+            struct ggml_tensor  * norm,
+            struct ggml_tensor  * state,
+            int                   n_seqs,
+            const int32_t       * slots,
+            const bool          * reset,
+            float                 lower_bound,
+            float                 eps_l2,
+            float                 eps_rms);
+
     GGML_API struct ggml_tensor * ggml_indexer_topk(
             struct ggml_context * ctx,
             struct ggml_tensor  * k,
@@ -2726,6 +2763,54 @@ extern "C" {
             int                   S,
             int                   n_iters,
             float                 eps);
+
+    // mHC pre-mix, fused. x [n_embd, S, T], mixes [2*S + (S-1)^2, T] = fn @ x (rms_eps >= 0) or fn @ rms_norm(x),
+    // scale [4], base [2*S + (S-1)^2].
+    // Result: flat F32 y [n_embd, T] | post [S, T] | comb [S, S, T] at float offsets 0, n_embd*T, (n_embd + S)*T.
+    // Exact top-M candidates of each logits row, for sampling on the host without the full row.
+    // a [n, rows] F32 contiguous rows -> F32 [2*M + 2, rows]:
+    //   [0, M)    values, in the strict order (value desc, index asc); entries past the valid count are -inf
+    //   [M, 2M)   row indices as floats (exact for n < 2^24); past the valid count: n
+    //   [2M]      number of non-finite values in the row (NaN, +inf, -inf)
+    //   [2M + 1]  valid count = number of entries with value > -inf among the first M of the order
+    // Every row index not listed has value <= the last listed value (or is non-finite).
+    GGML_API struct ggml_tensor * ggml_logits_topm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   m);
+
+    GGML_API struct ggml_tensor * ggml_raon_hc_pre(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * mixes,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 rms_eps,
+            float                 post_mag);
+
+    // MoE block for single-token decode: sigmoid-routed top-k SiTU experts plus one shared SiTU expert.
+    // Replaces ffn_moe_out + ffn_shexp + add.
+    //   x [n_embd, 1] F32, router_w [n_embd, n_expert] F32, router_b [n_expert] F32
+    //   up/gate_exps [n_embd, n_ff, n_expert], down_exps [n_ff, n_embd, n_expert]
+    //   up/gate_shexp [n_embd, n_ff_sh], down_shexp [n_ff_sh, n_embd]
+    // probs = sigmoid(router_w @ x); ids = top_k(probs + router_b); w = probs[ids] (/ sum if norm_w) * w_scale
+    // y = sum_k w_k * down_k(situ(gate_k x, up_k x)) + down_sh(situ(gate_sh x, up_sh x)) -> [n_embd, 1] F32
+    GGML_API struct ggml_tensor * ggml_raon_moe_block(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * router_w,
+            struct ggml_tensor  * router_b,
+            struct ggml_tensor  * up_exps,
+            struct ggml_tensor  * gate_exps,
+            struct ggml_tensor  * down_exps,
+            struct ggml_tensor  * up_shexp,
+            struct ggml_tensor  * gate_shexp,
+            struct ggml_tensor  * down_shexp,
+            int                   n_expert_used,
+            bool                  norm_w,
+            float                 w_scale,
+            float                 situ_beta,
+            float                 situ_linear_beta);
 
     GGML_API struct ggml_tensor * ggml_hc_post(
             struct ggml_context * ctx,

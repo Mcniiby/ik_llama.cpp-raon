@@ -74,15 +74,24 @@ delta_net::delta_net(llama_context & _lctx, const llama_batch & _batch) : lctx(_
         ? lctx.kv_self.ckpt.per_step_max_allocated
         : 0;
     save_per_step_states = lctx.kv_self.save_per_step_ssm && batch.n_tokens > 1 && batch.n_tokens <= max_per_step;
+    replay_window = save_per_step_states && llama_spec_replay_window(lctx.kv_self, batch);
 }
 
 delta_net::~delta_net() = default;
+
+llama_replay_layer * delta_net::replay_layer(int il) const {
+    auto & ckpt = lctx.kv_self.ckpt;
+    if (!replay_window || il < 0 || il >= (int) ckpt.replay.size() || !ckpt.replay[il].valid()) {
+        return nullptr;
+    }
+    return &ckpt.replay[il];
+}
 
 std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_context * ctx0,
         ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
         ggml_tensor * g, ggml_tensor * beta, ggml_tensor * state,
         int il, const llm_build_cb & cb, int repeat_type,
-        ggml_tensor * per_step_ckpt) {
+        ggml_tensor * per_step_ckpt, ggml_cgraph * gf, llama_replay_layer * replay) {
 
     const int64_t S_k      = q->ne[0];
     const int64_t H_k      = q->ne[2];
@@ -125,6 +134,12 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_co
     cb(g,         "g_fused", il);
     cb(beta,      "beta_fused", il);
     cb(state_flat,"state_fused", il);
+
+    if (replay) {
+        // replay rollback: keep this window's op inputs; the commit re-runs the accepted rows
+        GGML_ASSERT(gf != nullptr && per_step_ckpt == nullptr);
+        llama_replay_build_save(ctx0, gf, *replay, q, k, v, g, beta, repeat_type);
+    }
 
     ggml_tensor * fused_result = ggml_delta_net(ctx0, q, k, v, g, beta, state_flat, per_step_ckpt);
     cb(fused_result, "delta_net_fused_raw", il);
@@ -290,7 +305,7 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
         int64_t head_k_dim, int64_t num_k_heads, int64_t head_v_dim, int64_t num_v_heads, int64_t ssm_d_conv,
         int64_t state_seq_id_local, uint32_t qnext_state_slots, bool reset_state_local,
         float eps_norm, int repeat_type, int il, const llm_build_cb & cb, ggml_cgraph * gf,
-        ggml_tensor * per_step_ckpt, ggml_tensor * per_step_conv) {
+        ggml_tensor * per_step_ckpt, ggml_tensor * per_step_conv, ggml_tensor * v_scale, llama_replay_layer * replay) {
     const int64_t key_dim        = head_k_dim * num_k_heads;
     const int64_t value_dim      = head_v_dim * num_v_heads;
     const int64_t conv_dim       = key_dim * 2 + value_dim;
@@ -319,7 +334,8 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
         state_f32 = ggml_cast(ctx0, state_f32, GGML_TYPE_F32);
     }
     if (reset_state_local) {
-        state_f32 = ggml_scale(ctx0, state_f32, 0.0f);
+        // fill, not scale by 0: a NaN/inf left by an earlier sequence must not survive
+        state_f32 = ggml_fill(ctx0, state_f32, 0.0f);
         cb(state_f32, "state_reset", il);
     }
 
@@ -361,6 +377,12 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     cb(k_conv, "k_conv", il);
     cb(v_conv, "v_conv", il);
 
+    if (v_scale) {
+        // Raon-1 RDA: per-head write/erase gate ratio folded into V, [1, num_v_heads, n_seq_tokens, n_seqs]
+        v_conv = ggml_mul(ctx0, v_conv, v_scale);
+        cb(v_conv, "v_conv_scaled", il);
+    }
+
     if (n_seq_tokens > 1) {
         q_conv = ggml_permute(ctx0, q_conv, 0, 2, 1, 3);
         k_conv = ggml_permute(ctx0, k_conv, 0, 2, 1, 3);
@@ -375,8 +397,11 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     cb(q_conv, "q_conv_normed", il);
     cb(k_conv, "k_conv_normed", il);
 
+    if (replay && reset_state_local) {
+        replay = nullptr; // never a verify window
+    }
     auto [output, new_state] = build_fused_delta_net(ctx0, q_conv, k_conv, v_conv, gate, beta, state, il, cb, repeat_type,
-            per_step_ckpt);
+            per_step_ckpt, gf, replay);
 
     cb(output, "attn_output", il);
     cb(new_state, "new_state", il);
@@ -393,10 +418,16 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
             conv_state_dim * ggml_element_size(state_dst));
 
     // expand this one first: ggml_delta_net_find_state_cpy() matches this copy only while nothing
-    // but view no-ops stands between it and the op, and the backends then write the slot directly
-    auto ssm_cpy = ggml_cpy(ctx0, new_ssm_flat, ssm_dst);
-    cb(ssm_cpy, "ssm_state_cpy", il);
-    ggml_build_forward_expand(gf, ssm_cpy);
+    // but view no-ops stands between it and the op, and the backends then write the slot directly.
+    // A replay window leaves the slot at the window start: the commit replays the accepted rows.
+    if (!replay) {
+        auto ssm_cpy = ggml_cpy(ctx0, new_ssm_flat, ssm_dst);
+        cb(ssm_cpy, "ssm_state_cpy", il);
+        ggml_build_forward_expand(gf, ssm_cpy);
+    } else {
+        GGML_UNUSED(new_ssm_flat);
+        GGML_UNUSED(ssm_dst);
+    }
 
     auto conv_cpy = ggml_cpy(ctx0, new_conv_flat, conv_state_dst);
     cb(conv_cpy, "conv_state_cpy", il);
@@ -601,7 +632,7 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
 
     // Get per-step checkpoint tensor if available
     ggml_tensor * per_step_ckpt = nullptr;
-    if (save_per_step_states && il < (int)kv_self.ckpt.per_step_ssm.size()) {
+    if (save_per_step_states && il < (int)kv_self.ckpt.per_step_ssm.size() && !kv_self.ckpt.per_step_ssm[il].empty()) {
         per_step_ckpt = kv_self.ckpt.per_step_ssm[il].front();
     }
 
@@ -612,7 +643,8 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
         qkv_mixed, inp_s_seq_qnext, beta, gate,
         head_k_dim, num_k_heads, head_v_dim, num_v_heads, hparams.ssm_d_conv,
         state_seq_id_local, qnext_state_slots, reset_state_local, hparams.f_norm_rms_eps,
-        model.layers[il].ssm_beta_alpha ? 0 : 1, il, cb, gf, per_step_ckpt, per_step_conv);
+        model.layers[il].ssm_beta_alpha ? 0 : 1, il, cb, gf, per_step_ckpt, per_step_conv,
+        nullptr, replay_layer(il));
 
     auto gated_output = build_gated_output(lctx, ctx0, model.layers[il].ssm_norm, model.layers[il].ssm_out, output, z, head_v_dim, num_v_heads, n_tok, il, cb, gate_op);
     if (inp_out_ids) {

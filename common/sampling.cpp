@@ -4,6 +4,7 @@
 #include "common.h"
 #include "speculative.h"
 #include "reasoning-budget.cpp"
+#include "sampling-topk.h"
 
 #include <limits>
 #include <random>
@@ -448,7 +449,8 @@ static void sampler_queue(
     const common_params_sampling& params,
     common_sampler * ctx_sampling,
     llama_token_data_array& cur_p,
-    size_t   min_keep) {
+    size_t   min_keep,
+    size_t   seq_start = 0) {
     const float         temp = params.temp;
     const float         dynatemp_range = params.dynatemp_range;
     const float         dynatemp_exponent = params.dynatemp_exponent;
@@ -462,7 +464,8 @@ static void sampler_queue(
     const float         top_n_sigma = params.top_n_sigma;
 
     const std::vector<llama_sampler_type> & samplers_sequence = params.samplers_sequence;
-    for (auto sampler_type : samplers_sequence) {
+    for (size_t i_seq = seq_start; i_seq < samplers_sequence.size(); ++i_seq) {
+        const auto sampler_type = samplers_sequence[i_seq];
         switch (sampler_type) {
             case llama_sampler_type::DRY        : llama_sample_dry      (ctx_main, ctx_sampling->smpl, &cur_p); break;
             case llama_sampler_type::TOP_K      : llama_sample_top_k    (ctx_main, &cur_p, top_k,     min_keep); break;
@@ -507,6 +510,99 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
     return true;
 }
 
+// index of TOP_K in samplers_sequence when every sampler before it is a no-op under these params, else -1
+static int common_sampler_fast_topk_pos(const common_params_sampling & p) {
+    if (p.top_k <= 0) {
+        return -1;
+    }
+    for (size_t i = 0; i < p.samplers_sequence.size(); ++i) {
+        switch (p.samplers_sequence[i]) {
+            case llama_sampler_type::TOP_K      : return (int) i;
+            case llama_sampler_type::DRY        : if (p.dry_multiplier == 0.0f || p.dry_base < 1.0f || p.dry_penalty_last_n == 0) continue; return -1;
+            case llama_sampler_type::TFS_Z      : if (p.tfs_z >= 1.0f) continue; return -1;
+            case llama_sampler_type::TYPICAL_P  : if (p.typical_p >= 1.0f) continue; return -1;
+            case llama_sampler_type::TOP_P      : if (p.top_p >= 1.0f) continue; return -1;
+            case llama_sampler_type::MIN_P      : if (p.min_p <= 0.0f) continue; return -1;
+            case llama_sampler_type::XTC        : if (p.xtc_probability <= 0.0f || p.xtc_threshold > 0.5f) continue; return -1;
+            case llama_sampler_type::TOP_N_SIGMA: if (p.top_n_sigma <= 0.0f) continue; return -1;
+            case llama_sampler_type::ADAPTIVE_P : continue; // not handled in sampler_queue's switch
+            default: return -1;
+        }
+    }
+    return -1;
+}
+
+static bool common_sampler_fast_topk_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_SAMPLER_FAST_TOPK");
+        return !(e && e[0] == '0');
+    }();
+    return enabled;
+}
+
+// fast path only for plain temperature sampling (no grammar, CFG, allow-list biases, adaptive-p, mirostat)
+#define COMMON_FAST_TOPK_GREEDY (-2)
+
+static int common_sampler_fast_topk_eligible(const common_sampler * gsmpl, const llama_context * ctx_cfg, int n_vocab) {
+    const auto & p = gsmpl->params;
+    if (!common_sampler_fast_topk_enabled() || gsmpl->grammar != nullptr || ctx_cfg != nullptr ||
+        p.temp < 0.0f || p.mirostat != 0 || gsmpl->adapt_p_ctx != nullptr ||
+        (gsmpl->server_biases != nullptr && (int) gsmpl->server_biases->size() == n_vocab) ||
+        (gsmpl->rbudget != nullptr && common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_FORCING)) {
+        return -1;
+    }
+    if (p.temp == 0.0f) {
+        // greedy is the unique top-1; n_probs readers expect the full row
+        return p.n_probs == 0 ? COMMON_FAST_TOPK_GREEDY : -1;
+    }
+    return common_sampler_fast_topk_pos(p);
+}
+
+// GPU candidates (llama_get_logits_cand_ith)
+static bool common_sampler_gpu_cand_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_GSAMPLE");
+        return !(e && e[0] == '0');
+    }();
+    return enabled;
+}
+
+// (token, count) for the penalty window, without the newline token when !penalize_nl
+static void common_sampler_penalty_counts(const common_sampler * gsmpl, const llama_context * ctx_main, int n_vocab,
+        std::vector<std::pair<llama_token, int>> & out) {
+    out.clear();
+    const auto & params = gsmpl->params;
+    const int32_t penalty_last_n = params.penalty_last_n < 0 ? params.n_prev : params.penalty_last_n;
+    const auto & penalty_tokens  = params.use_penalty_prompt_tokens ? params.penalty_prompt_tokens : gsmpl->prev;
+    const int used = std::min((int) penalty_tokens.size(), penalty_last_n);
+    if (used <= 0 || (params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f)) {
+        return;
+    }
+    const llama_token nl_token = llama_token_nl(llama_get_model(ctx_main));
+    std::unordered_map<llama_token, int> token_count;
+    const llama_token * last = penalty_tokens.data() + penalty_tokens.size() - used;
+    for (int i = 0; i < used; ++i) {
+        token_count[last[i]]++;
+    }
+    out.reserve(token_count.size());
+    for (const auto & [tok, count] : token_count) {
+        if (tok < 0 || tok >= n_vocab || (!params.penalize_nl && tok == nl_token)) {
+            continue;
+        }
+        out.emplace_back(tok, count);
+    }
+}
+
+static llama_token_data_array llama_sampling_prepare_impl(
+                  struct common_sampler * ctx_sampling,
+                  struct llama_context * ctx_main,
+                  struct llama_context * ctx_cfg,
+                  const int idx,
+                  bool grammar_first,
+                  std::vector<float> * original_logits,
+                  int fast_topk_k = 0,
+                  bool * fast_topk_done = nullptr);
+
 static llama_token llama_sampling_sample_impl(
                   struct common_sampler * ctx_sampling,
                   struct llama_context * ctx_main,
@@ -522,7 +618,15 @@ static llama_token llama_sampling_sample_impl(
     const float   adaptive_target = params.adaptive_target;
 
     std::vector<float> original_logits;
-    llama_sampling_prepare(ctx_sampling, ctx_main, ctx_cfg, idx, /* grammar_first= */ grammar_first, &original_logits);
+    const int n_vocab_s   = llama_n_vocab(llama_get_model(ctx_main));
+    const int fast_pos    = common_sampler_fast_topk_eligible(ctx_sampling, ctx_cfg, n_vocab_s);
+    const int fast_k      = fast_pos >= 0 ? std::min(std::max(params.top_k, std::max(1, params.min_keep)), n_vocab_s) :
+                            fast_pos == COMMON_FAST_TOPK_GREEDY ? 1 : 0;
+    bool      fast_done   = false;
+    llama_sampling_prepare_impl(ctx_sampling, ctx_main, ctx_cfg, idx, /* grammar_first= */ grammar_first, &original_logits,
+            fast_k, &fast_done);
+    // the fast path already applied everything up to and including TOP_K
+    const size_t seq_start = fast_done && fast_pos >= 0 ? (size_t) fast_pos + 1 : 0;
     llama_token_data_array & cur_p = ctx_sampling->cur_p;
     if (ctx_sampling->grammar != NULL && !grammar_first) {
         GGML_ASSERT(!original_logits.empty());
@@ -530,7 +634,6 @@ static llama_token llama_sampling_sample_impl(
     auto & rbudget = ctx_sampling->rbudget;
 
     llama_token id = 0;
-    float * logits = llama_get_logits_ith(ctx_main, idx);
     // apply reasoning budget first
     common_reasoning_budget_apply(rbudget, &cur_p);
     // Sample grammar first for resampling
@@ -564,7 +667,7 @@ static llama_token llama_sampling_sample_impl(
             // temperature sampling
             size_t min_keep = std::max(1, params.min_keep);
 
-            sampler_queue(ctx_main, params,ctx_sampling, cur_p, min_keep);
+            sampler_queue(ctx_main, params,ctx_sampling, cur_p, min_keep, seq_start);
             id = llama_sample_token_with_rng(ctx_main, &cur_p, ctx_sampling->rng);
 
         }
@@ -609,7 +712,9 @@ static llama_token_data_array llama_sampling_prepare_impl(
                   struct llama_context * ctx_cfg,
                   const int idx,
                   bool grammar_first,
-                  std::vector<float> * original_logits) {
+                  std::vector<float> * original_logits,
+                  int fast_topk_k,
+                  bool * fast_topk_done) {
     const common_params_sampling & params = ctx_sampling->params;
 
     const int n_vocab = llama_n_vocab(llama_get_model(ctx_main));
@@ -623,6 +728,31 @@ static llama_token_data_array llama_sampling_prepare_impl(
 
     auto & prev = ctx_sampling->prev;
     auto & cur  = ctx_sampling->cur;
+
+    // GPU candidates: exact top-k from the device's top-n logits without reading the full row.
+    // Same eligibility as the CPU fast path, plus no CFG, no n_probs, no expiring biases.
+    if (fast_topk_k > 0 && fast_topk_done != nullptr && ctx_cfg == nullptr && ctx_sampling->grammar == NULL &&
+            params.n_probs == 0 && !(ctx_sampling->elb_states.size() > ctx_sampling->elb_idx) &&
+            common_sampler_gpu_cand_enabled()) {
+        llama_logits_cand cand;
+        if (llama_get_logits_cand_ith(ctx_main, idx, &cand) && cand.n >= fast_topk_k) {
+            std::vector<std::pair<llama_token, float>> bias(params.logit_bias.begin(), params.logit_bias.end());
+            std::vector<std::pair<llama_token, int>> counts;
+            common_sampler_penalty_counts(ctx_sampling, ctx_main, n_vocab, counts);
+            cur.resize(n_vocab);
+            if (common_sampler_cand_topk(cand.ids, cand.logits, cand.n, cand.thr, bias.data(), (int) bias.size(),
+                        counts.data(), (int) counts.size(), penalty_repeat, penalty_freq, penalty_present,
+                        fast_topk_k, ctx_sampling->topk_work, cur.data())) {
+                std::vector<llama_token> b_ids;
+                std::vector<float>       b_val;
+                for (const auto & b : bias) { b_ids.push_back(b.first); b_val.push_back(b.second); }
+                llama_logits_cand_consume(ctx_main, idx, b_ids.data(), b_val.data(), (int32_t) b_ids.size());
+                ctx_sampling->cur_p = { cur.data(), (size_t) fast_topk_k, 0, true };
+                *fast_topk_done = true;
+                return ctx_sampling->cur_p;
+            }
+        }
+    }
 
     // Get a pointer to the logits
     float * logits = llama_get_logits_ith(ctx_main, idx);
@@ -649,6 +779,43 @@ static llama_token_data_array llama_sampling_prepare_impl(
 
     cur.resize(n_vocab);
 
+    const auto& penalty_tokens = params.use_penalty_prompt_tokens ? params.penalty_prompt_tokens : prev;
+    const int penalty_tokens_used_size = std::min((int)penalty_tokens.size(), penalty_last_n);
+
+    if (fast_topk_k > 0 && fast_topk_done != nullptr) {
+        // exact fast path: penalties only touch the last penalty_last_n ids, so compute those directly
+        // (same float ops as llama_sample_repetition_penalties_impl), then top-k from the float row
+        std::vector<std::pair<llama_token, float>> pen;
+        if (penalty_tokens_used_size && !(penalty_repeat == 1.0f && penalty_freq == 0.0f && penalty_present == 0.0f)) {
+            const llama_token nl_token = llama_token_nl(llama_get_model(ctx_main));
+            std::unordered_map<llama_token, int> token_count;
+            const llama_token * last = penalty_tokens.data() + penalty_tokens.size() - penalty_tokens_used_size;
+            for (int i = 0; i < penalty_tokens_used_size; ++i) {
+                token_count[last[i]]++;
+            }
+            pen.reserve(token_count.size());
+            for (const auto & [tok, count] : token_count) {
+                if (tok < 0 || tok >= n_vocab || (!penalize_nl && tok == nl_token)) {
+                    continue;
+                }
+                float l = logits[tok];
+                if (l <= 0) {
+                    l *= penalty_repeat;
+                } else {
+                    l /= penalty_repeat;
+                }
+                l -= float(count) * penalty_freq + float(count > 0) * penalty_present;
+                pen.emplace_back(tok, l);
+            }
+        }
+        if (common_sampler_topk_exact(logits, n_vocab, fast_topk_k, pen.data(), (int) pen.size(),
+                    ctx_sampling->topk_work, cur.data())) {
+            ctx_sampling->cur_p = { cur.data(), (size_t) fast_topk_k, 0, true };
+            *fast_topk_done = true;
+            return ctx_sampling->cur_p;
+        }
+    }
+
     if ((ctx_sampling->server_biases != nullptr) && (ctx_sampling->server_biases->size() == n_vocab)) {
         for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
             cur[token_id] = llama_token_data{token_id, logits[token_id] + ctx_sampling->server_biases->at(token_id), 0.0f};
@@ -664,8 +831,6 @@ static llama_token_data_array llama_sampling_prepare_impl(
     llama_token_data_array & cur_p = ctx_sampling->cur_p;
 
     // apply penalties
-    const auto& penalty_tokens = params.use_penalty_prompt_tokens ? params.penalty_prompt_tokens : prev;
-    const int penalty_tokens_used_size = std::min((int)penalty_tokens.size(), penalty_last_n);
     if (penalty_tokens_used_size) {
         // llama_token_nl() can legitimately return LLAMA_TOKEN_NULL (-1). Some vocabs (e.g. Falcon3's
         // BPE tokenizer) tokenize "\n" to zero tokens, and the loader's fallback

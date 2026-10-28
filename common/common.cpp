@@ -1192,6 +1192,27 @@ static void common_speculative_stage_apply_kv(
         }
         return;
     }
+    if (key == "auto") {
+        stage.auto_draft = std::stoi(value_raw);
+        if (stage.auto_draft < 0 || stage.auto_draft > 1) {
+            throw std::invalid_argument("speculative stage auto must be 0 or 1");
+        }
+        return;
+    }
+    if (key == "auto_gain") {
+        stage.auto_gain = std::stof(value_raw);
+        if (stage.auto_gain < 0.5f || stage.auto_gain > 4.0f) {
+            throw std::invalid_argument("speculative stage auto_gain must be between 0.5 and 4");
+        }
+        return;
+    }
+    if (key == "auto_cooldown") {
+        stage.auto_cooldown = std::stoi(value_raw);
+        if (stage.auto_cooldown < 1) {
+            throw std::invalid_argument("speculative stage auto_cooldown must be at least 1");
+        }
+        return;
+    }
     if (key == "suffix_corpus") {
         stage.suffix_corpus = value_raw;
         if (stage.suffix_corpus.empty()) {
@@ -1795,13 +1816,16 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
             params.speculative.spec_ckpt_mode = LLAMA_SPEC_CKPT_AUTO;
         } else if (val == "per-step" || val == "PER_STEP") {
             params.speculative.spec_ckpt_mode = LLAMA_SPEC_CKPT_PER_STEP;
+        } else if (val == "replay" || val == "REPLAY") {
+            params.speculative.spec_ckpt_mode = LLAMA_SPEC_CKPT_PER_STEP;
+            params.speculative.spec_ckpt_replay = true;
         } else if (val == "gpu-fallback" || val == "GPU_FALLBACK") {
             params.speculative.spec_ckpt_mode = LLAMA_SPEC_CKPT_GPU_FALLBACK;
         } else if (val == "cpu" || val == "CPU") {
             params.speculative.spec_ckpt_mode = LLAMA_SPEC_CKPT_CPU;
         } else {
             throw std::invalid_argument("unknown " + std::string(arg) + " value: " + val +
-                "; expected auto, per-step, gpu-fallback, or cpu");
+                "; expected auto, per-step, replay, gpu-fallback, or cpu");
         }
         if (arg == "--recurrent-ckpt-mode") {
             fprintf(stderr, "warning: --recurrent-ckpt-mode is deprecated; use --spec-ckpt-mode\n");
@@ -3663,6 +3687,8 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*", "--spec-ckpt-mode MODE",         "checkpoint strategy for speculative decoding\n"
                                                               "  auto         auto-select: per-step if CUDA full-GPU, gpu-fallback otherwise (default)\n"
                                                               "  per-step     save architecture state per draft step; no re-decode on rejection\n"
+                                                              "  replay       per-step, but delta-net layers keep the window inputs and re-run the\n"
+                                                              "               accepted rows at commit instead of saving N-1 states (also LLAMA_SPEC_REPLAY=1)\n"
                                                               "  gpu-fallback copy architecture state to a device buffer; re-decode on rejection\n"
                                                               "  cpu          serialise architecture state via host storage; re-decode on rejection\n"
                                                               "  --recurrent-ckpt-mode remains as a deprecated alias" });

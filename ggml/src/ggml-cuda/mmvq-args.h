@@ -23,5 +23,6 @@ struct mmvq_args {
     const uint64_t bias_nb1;
     ggml_unary_op  unary_op;
     float          limit;
+    float          limit2; // SiTU: limit = beta, limit2 = linear beta
 };
 

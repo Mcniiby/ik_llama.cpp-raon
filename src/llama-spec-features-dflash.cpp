@@ -100,6 +100,14 @@ int32_t llama_model_dflash_n_target_features(const struct llama_model * model) {
     return model ? (int32_t) model->hparams.dflash_n_target_features : 0;
 }
 
+// hc streams per captured target row (Raon-1 taps all mHC streams; DSV4 captures the stream mean)
+int32_t llama_model_dflash_target_streams(const struct llama_model * model) {
+    if (!model || model->arch != LLM_ARCH_RAON1 || model->hparams.dsv4_hc_mult <= 1) {
+        return 1;
+    }
+    return (int32_t) model->hparams.dsv4_hc_mult;
+}
+
 int32_t llama_model_dflash_target_layer_ids(
         const struct llama_model * model,
         int32_t * layer_ids,
@@ -338,6 +346,13 @@ bool llama_model_share_dflash_io_tensors(
     }
 
     const struct ggml_tensor * output = llama_dflash_output_tensor(draft_model, dflash2);
+    // trimmed target head: the draft's logits / argmax / lattice ids are head rows, not token ids
+    if (output != nullptr && !target_model->output_token_ids.empty() &&
+            output->ne[1] == (int64_t) target_model->output_token_ids.size()) {
+        draft_model->output_token_ids = target_model->output_token_ids;
+        LLAMA_LOG_INFO("%s: DFlash draft uses the target's trimmed head (%zu rows), ids mapped back to the full vocab\n",
+                __func__, draft_model->output_token_ids.size());
+    }
     return draft_model->tok_embd != nullptr && output != nullptr;
 }
 

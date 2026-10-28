@@ -200,6 +200,11 @@ struct common_speculative_stage_params {
     int32_t suffix_max_depth = -1;
     std::string suffix_corpus;
 
+    // DFlash acceptance-gated draft length: auto=1, auto_gain=F, auto_cooldown=N
+    int32_t auto_draft = -1;
+    float   auto_gain = -1.0f;
+    int32_t auto_cooldown = -1;
+
     bool has_n_max_override() const { return n_max >= 0; }
     bool has_n_min_override() const { return n_min >= 0; }
     bool has_p_min_override() const { return p_min >= 0.0f; }
@@ -227,6 +232,8 @@ struct common_params_speculative {
 
     // Generic speculative checkpoint mode, recurrent spelling is a compatibility alias.
     int spec_ckpt_mode = LLAMA_SPEC_CKPT_AUTO;
+    // per-step mode with replay rollback for delta-net layers (--spec-ckpt-mode replay)
+    bool spec_ckpt_replay = false;
 
     std::string devices;
     std::string params;

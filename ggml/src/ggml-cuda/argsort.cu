@@ -150,9 +150,18 @@ static __global__ void k_argsort_f32_f32_i32(const float * x_biased, const float
     }
 }
 
+// norm: optional sum_rows/div/scale tail of the router (Raon, DeepSeek-V3 style sigmoid routing): with norm.wnorm set,
+// also writes the row sums of the selected weights, weights/sum and (with norm.wscaled) weights/sum*scale
+struct argsort_biased_norm {
+    float * sums    = nullptr; // [nrows]
+    float * wnorm   = nullptr; // [nrows, ntop]
+    float * wscaled = nullptr; // [nrows, ntop]
+    float   scale   = 1.0f;
+};
+
 template<ggml_sort_order order>
 static __global__ void k_argsort_biased_f32_f32_i32(const float * x, const float * bias, float * weights, int * ids, const int ncols, int ncols_pad, int ntop,
-        size_t nb_ids) {
+        size_t nb_ids, argsort_biased_norm norm) {
     // bitonic sort
     int col = threadIdx.x;
     int row = blockIdx.x;
@@ -172,10 +181,34 @@ static __global__ void k_argsort_biased_f32_f32_i32(const float * x, const float
 
     sort<order>(ncols_pad, ncols, col, x_row, dst_row);
 
+    float w = 0.0f;
     if (col < ntop) {
-        weights[row * ntop + col] = 1/(1 + expf(-x[row * ncols + dst_row[col]]));
+        w = 1/(1 + expf(-x[row * ncols + dst_row[col]]));
+        weights[row * ntop + col] = w;
         auto row_ids = (int *)((char *)ids + row*nb_ids);
         row_ids[col] = dst_row[col];
+    }
+
+    if (norm.wnorm) {
+        // sort() ends with a barrier and x_row is not read after it, so its first ntop slots can hold the weights
+        if (col < ntop) {
+            x_row[col] = w;
+        }
+        __syncthreads();
+        if (col < ntop) {
+            float sum = 0.0f;
+            for (int j = 0; j < ntop; ++j) {
+                sum += x_row[j];
+            }
+            const float wn = w / sum;
+            norm.wnorm[row * ntop + col] = wn;
+            if (norm.wscaled) {
+                norm.wscaled[row * ntop + col] = wn * norm.scale;
+            }
+            if (col == 0 && norm.sums) {
+                norm.sums[row] = sum;
+            }
+        }
     }
 }
 
@@ -378,7 +411,7 @@ static void argsort_f32_f32_i32_cuda(const float * x_biased, const float * x, co
 }
 
 static void argsort_biased_f32_f32_i32_cuda(const float * x, const float * bias, float * weights, int * ids, const int ncols, const int nrows, int ntop,
-        size_t nb_ids, ggml_sort_order order, cudaStream_t stream) {
+        size_t nb_ids, ggml_sort_order order, cudaStream_t stream, const argsort_biased_norm & norm = {}) {
     // bitonic sort requires ncols to be power of 2
     const int ncols_pad = next_power_of_2(ncols);
 
@@ -391,10 +424,10 @@ static void argsort_biased_f32_f32_i32_cuda(const float * x, const float * bias,
 
     if (order == GGML_SORT_ORDER_ASC) {
         k_argsort_biased_f32_f32_i32<GGML_SORT_ORDER_ASC><<<block_nums, block_dims, shared_mem, stream>>>(x, bias, weights, ids,
-                ncols, ncols_pad, ntop, nb_ids);
+                ncols, ncols_pad, ntop, nb_ids, norm);
     } else if (order == GGML_SORT_ORDER_DESC) {
         k_argsort_biased_f32_f32_i32<GGML_SORT_ORDER_DESC><<<block_nums, block_dims, shared_mem, stream>>>(x, bias, weights, ids,
-                ncols, ncols_pad, ntop, nb_ids);
+                ncols, ncols_pad, ntop, nb_ids, norm);
     } else {
         GGML_ABORT("fatal error");
     }
@@ -769,6 +802,42 @@ void cuda_glm45moe_experts(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     argsort_biased_f32_f32_i32_cuda((const float *)probs->data, (const float *)bias->data, (float *)dst->data, (int *)topk->data,
             ne00, nrows, ne0, topk->nb[1], GGML_SORT_ORDER_DESC, ctx.stream());
 
+}
+
+// cuda_glm45moe_experts plus the weight normalization tail: sum (SUM_ROWS), div (DIV of the selected weights by the sum)
+// and optionally scaled (SCALE of the reshaped div). Every intermediate node is written, so other readers stay valid.
+void cuda_glm45moe_experts_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * topk_view,
+        ggml_tensor * sum, ggml_tensor * div, ggml_tensor * scaled) {
+    GGML_ASSERT(topk_view->op == GGML_OP_VIEW);
+    auto topk     = topk_view->src[0];
+    auto topk_src = topk->src[0];
+    auto probs    = topk_src->src[0]->src[0];
+    auto bias     = topk_src->src[1];
+
+    auto nrows = ggml_nrows(probs);
+
+    int ne00 = probs->ne[0];
+    int ne0  = topk_view->ne[0];
+    GGML_ASSERT(ggml_is_contiguous(probs));
+    GGML_ASSERT(bias->ne[1] == 1);
+    GGML_ASSERT(bias->ne[0] == probs->ne[0]);
+    GGML_ASSERT(ne0 == dst->ne[1]);
+    GGML_ASSERT(ne0 <= ne00);
+    GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(sum) && ggml_is_contiguous(div));
+    GGML_ASSERT(ggml_nelements(div) == ggml_nelements(dst) && ggml_nelements(sum) == nrows);
+
+    argsort_biased_norm norm;
+    norm.sums  = (float *)sum->data;
+    norm.wnorm = (float *)div->data;
+    if (scaled) {
+        GGML_ASSERT(ggml_is_contiguous(scaled) && ggml_nelements(scaled) == ggml_nelements(dst));
+        norm.wscaled = (float *)scaled->data;
+        float s; memcpy(&s, scaled->op_params, sizeof(float));
+        norm.scale = s;
+    }
+
+    argsort_biased_f32_f32_i32_cuda((const float *)probs->data, (const float *)bias->data, (float *)dst->data, (int *)topk->data,
+            ne00, nrows, ne0, topk->nb[1], GGML_SORT_ORDER_DESC, ctx.stream(), norm);
 }
 
 void cuda_openai_experts(ggml_backend_cuda_context & ctx, ggml_tensor * topk, ggml_tensor * softmax) {

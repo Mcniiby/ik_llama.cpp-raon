@@ -2087,7 +2087,11 @@ void llm_load_hparams(
                         throw std::runtime_error("dflash2: target_layers must use one-based IDs");
                     }
                 }
-                hparams.dflash_n_target_features = hparams.n_embd * hparams.dflash_n_target_layers;
+                // per-tap width: n_embd by default, n_streams*n_embd for a hyper-connection target (Raon-1)
+                uint32_t target_hidden_size = 0;
+                ml.get_key("dflash.target_hidden_size", target_hidden_size, false);
+                hparams.dflash_n_target_features = (target_hidden_size > 0 ? target_hidden_size : hparams.n_embd) *
+                        hparams.dflash_n_target_layers;
                 if (hparams.dflash_selector_top_k == 0 ||
                         hparams.n_embd < hparams.dflash_selector_top_k * (hparams.dflash_selector_top_k + 1)) {
                     throw std::runtime_error("dflash2: hidden size is too small for selector top-k lattice");
@@ -2629,6 +2633,63 @@ void llm_load_hparams(
 
                 switch (hparams.n_layer - hparams.nextn_predict_layers) {
                     case 45: model.type = e_model::MODEL_312B_A17B; break; // GLM-5.3-Flash
+                    default: model.type = e_model::MODEL_UNKNOWN;
+                }
+            } break;
+        case LLM_ARCH_RAON1:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,   hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_ATTENTION_LATENT_NORM_RMS_EPS, hparams.f_norm_rms_eps_latent);
+
+                // absorbed MLA: key/value_length are the latent widths, the per-head widths are the *_mla ones
+                ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,      hparams.n_lora_q);
+                ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK,     hparams.n_lora_kv);
+                ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   hparams.n_embd_head_k_full);
+                ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, hparams.n_embd_head_v_full);
+                hparams.n_embd_head_k_swa = hparams.n_embd_head_k_full;
+                hparams.n_embd_head_v_swa = hparams.n_embd_head_v_full;
+                GGML_ASSERT(hparams.n_embd_head_k_full > hparams.n_rot && hparams.n_lora_q > 0 && hparams.n_lora_kv > 0);
+
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
+                hparams.n_ff_shexp = hparams.n_ff_exp;
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm);
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func);
+
+                ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,      hparams.dsv4_hc_mult);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,    hparams.dsv4_hc_eps);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_MAGNITUDE,  hparams.hc_magnitude);
+                ml.get_key(LLM_KV_ACTIVATION_SITU_BETA,        hparams.situ_beta);
+                ml.get_key(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, hparams.situ_linear_beta);
+                GGML_ASSERT(hparams.dsv4_hc_mult >= 2 && hparams.dsv4_hc_mult <= 8);
+                GGML_ASSERT(hparams.situ_beta > 0 && hparams.hc_magnitude > 0);
+
+                // RDA: the GGUF's ssm.time_step_rank is the decay-gate low rank, kept in ssm_f_rank
+                ml.get_key(LLM_KV_SSM_CONV_KERNEL,      hparams.ssm_d_conv);
+                ml.get_key(LLM_KV_KDA_HEAD_DIM,         hparams.ssm_d_state);
+                ml.get_key(LLM_KV_SSM_TIME_STEP_RANK,   hparams.ssm_f_rank);
+                hparams.kda_gate_lower_bound = -INFINITY;
+                ml.get_key(LLM_KV_KDA_GATE_LOWER_BOUND, hparams.kda_gate_lower_bound, false);
+                GGML_ASSERT(hparams.kda_gate_lower_bound < 0.0f && hparams.kda_gate_lower_bound > -INFINITY &&
+                        "RAON1: only the bounded sigmoid decay gate is implemented");
+                GGML_ASSERT(hparams.ssm_d_conv == 4);
+                hparams.ssm_dt_rank = hparams.n_head();
+                hparams.ssm_n_group = hparams.n_head();
+                hparams.ssm_d_inner = hparams.ssm_d_state * hparams.ssm_dt_rank;
+
+                // head_count_kv: 0 marks the RDA (recurrent) layers, 1 the MLA layers
+                uint32_t n_rda = 0;
+                for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                    hparams.recurrent_layer_arr[il] = hparams.n_head_kv_arr[il] == 0;
+                    n_rda += hparams.recurrent_layer_arr[il];
+                    GGML_ASSERT(hparams.recurrent_layer_arr[il] || hparams.n_head_kv_arr[il] == 1);
+                }
+                GGML_ASSERT(n_rda > 0 && n_rda < hparams.n_layer);
+
+                switch (hparams.n_layer) {
+                    case 25: model.type = e_model::MODEL_30B_A3B; break;
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;

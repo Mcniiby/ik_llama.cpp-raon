@@ -903,6 +903,12 @@ extern "C" {
         LLAMA_SPEC_CKPT_RESTORE_BASE_REPLAY_REQUIRED = 2,
     };
 
+    // Replay rollback for recurrent (delta-net) layers in per-step mode: save the verify window's
+    // inputs and re-run the recurrence over the accepted rows instead of dumping the state per token.
+    // Call before llama_spec_ckpt_init(); LLAMA_SPEC_REPLAY=1/0 in the environment overrides it.
+    LLAMA_API void llama_spec_ckpt_set_replay(struct llama_context * ctx, bool enable);
+    LLAMA_API bool llama_spec_ckpt_replay_active(const struct llama_context * ctx);
+
     // Initialise the checkpoint system for the upcoming speculation window.
     LLAMA_API int llama_spec_ckpt_init(struct llama_context * ctx, llama_ckpt_data ckpt_type, int mode, int max_tokens);
 
@@ -1192,6 +1198,24 @@ extern "C" {
     // Negative indices can be used to access logits in reverse order, -1 is the last logit.
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
+
+    // GPU logits candidates (LLAMA_GSAMPLE): the top n raw logits of output i, without copying the full row.
+    // ids/logits are in the strict order (logit desc, id asc); every vocab id not listed has raw logit <= thr
+    // (trimmed-head fill values included). Raw = exactly the floats llama_get_logits_ith() would return.
+    // Returns false (use llama_get_logits_ith) when not available: kill switch, no candidate op in the graph,
+    // non-finite logits, or the row was already read or consumed.
+    typedef struct llama_logits_cand {
+        int32_t         n;
+        const int32_t * ids;
+        const float   * logits;
+        float           thr;
+    } llama_logits_cand;
+    LLAMA_API bool llama_get_logits_cand_ith(struct llama_context * ctx, int32_t i, llama_logits_cand * out);
+
+    // The sampler used the candidates of output i. The (id, delta) biases it applied are added to that row if the
+    // full logits are read later (the CPU sampler leaves them in the row). Later cand queries for i return false.
+    LLAMA_API void llama_logits_cand_consume(struct llama_context * ctx, int32_t i,
+            const llama_token * bias_ids, const float * bias_deltas, int32_t n_bias);
 
     // Get the argmax token ID for DFlash draft position i without materializing full logits.
     // Returns LLAMA_TOKEN_NULL if argmax is not available (falls back to logits path).

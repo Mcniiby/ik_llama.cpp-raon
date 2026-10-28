@@ -5,6 +5,9 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
+
+#include <cstdlib>
 
 static std::pair<ggml_tensor *, ggml_tensor *> build_kda_qkvz(llama_context & lctx, ggml_context * ctx0,
         ggml_tensor * wq, ggml_tensor * wk, ggml_tensor * wv, ggml_tensor * ssm_g_a, ggml_tensor * ssm_g_b,
@@ -110,6 +113,7 @@ ggml_tensor * delta_net::build_layer_attn_kda_core(ggml_context * ctx0, ggml_cgr
     auto & layer   = model.layers[il];
 
     if (model.split_mode == LLAMA_SPLIT_MODE_GRAPH && kv_self.s_l[il]->extra) {
+        GGML_ASSERT(!layer.ssm_rda && "Raon-1 RDA layers do not support split mode graph");
         auto split_s_l = (ggml_split_tensor_t *) kv_self.s_l[il]->extra;
         GGML_ASSERT(split_s_l && split_s_l->n_device > 1);
 
@@ -208,10 +212,29 @@ ggml_tensor * delta_net::build_layer_attn_kda_core(ggml_context * ctx0, ggml_cgr
     auto [beta, log_decay] = build_kda_beta_gate(lctx, ctx0,
             layer.ssm_beta, layer.ssm_f_a, layer.ssm_f_b, layer.ssm_dt_b, layer.ssm_a,
             cur, head_dim, n_head, hparams.kda_gate_lower_bound, il, cb, gf);
-    auto conv = build_kda_conv(ctx0, layer.ssm_conv1d_q, layer.ssm_conv1d_k, layer.ssm_conv1d_v);
+    // Raon-1 loads the q/k/v conv weights as views of one merged tensor: avoids the concat per graph
+    auto conv = layer.ssm_conv1d && layer.ssm_conv1d_q->view_src == layer.ssm_conv1d
+              ? layer.ssm_conv1d
+              : build_kda_conv(ctx0, layer.ssm_conv1d_q, layer.ssm_conv1d_k, layer.ssm_conv1d_v);
+
+    // Raon-1 RDA: erase gate sigmoid(beta), write gate sigmoid(beta + rda(x)); the op applies the erase gate
+    // and V is scaled by the write/erase ratio
+    ggml_tensor * v_scale = nullptr;
+    float eps_l2 = hparams.f_norm_rms_eps;
+    if (layer.ssm_rda) {
+        auto delta = llm_build_context::llm_build_lora_mm(lctx, ctx0, layer.ssm_rda, cur);
+        delta = ggml_reshape_4d(ctx0, delta, n_head, 1, n_tok, 1);
+        auto erase = ggml_softplus(ctx0, ggml_neg(ctx0, beta));
+        auto write = ggml_softplus(ctx0, ggml_neg(ctx0, ggml_add(ctx0, beta, delta)));
+        v_scale = ggml_exp(ctx0, ggml_sub(ctx0, erase, write));
+        v_scale = ggml_reshape_4d(ctx0, v_scale, 1, n_head, n_tok, 1);
+        cb(v_scale, "rda_v_scale", il);
+        // same as HF F.normalize(eps=1e-6)
+        eps_l2 = 1e-6f;
+    }
 
     ggml_tensor * per_step_ckpt = nullptr;
-    if (save_per_step_states && il < (int) kv_self.ckpt.per_step_ssm.size()) {
+    if (save_per_step_states && il < (int) kv_self.ckpt.per_step_ssm.size() && !kv_self.ckpt.per_step_ssm[il].empty()) {
         per_step_ckpt = kv_self.ckpt.per_step_ssm[il].front();
     }
     auto per_step_conv = save_per_step_states && il < (int) kv_self.ckpt.per_step_conv.size() &&
@@ -222,7 +245,7 @@ ggml_tensor * delta_net::build_layer_attn_kda_core(ggml_context * ctx0, ggml_cgr
             inp_s_seq_qnext, beta, log_decay,
             head_dim, n_head, head_dim, n_head, hparams.ssm_d_conv,
             state_seq_id_local, qnext_state_slots, reset_state_local,
-            hparams.f_norm_rms_eps, 1, il, cb, gf, per_step_ckpt, per_step_conv);
+            eps_l2, 1, il, cb, gf, per_step_ckpt, per_step_conv, v_scale, replay_layer(il));
     auto gated_output = build_kda_gated_output(lctx, ctx0, layer.ssm_norm, layer.ssm_out, output, z,
             head_dim, n_head, n_tok, il, cb);
 
@@ -235,17 +258,184 @@ ggml_tensor * delta_net::build_layer_attn_kda_core(ggml_context * ctx0, ggml_cgr
     return output;
 }
 
+// RAON_RDA_FUSED: 1 (default) fused GGML_OP_RDA_DECODE for small batches with the state in device memory,
+// 2 also with the state in host memory, 0 unfused graph
+static int raon_rda_fused_mode() {
+    static const int mode = [] {
+        const char * e = getenv("RAON_RDA_FUSED");
+        const int m = e ? atoi(e) : 1;
+        return m >= 0 && m <= 2 ? m : 1;
+    }();
+    return mode;
+}
+
+static constexpr int RAON_RDA_FUSED_MAX_TOKENS = 4; // <= GGML_RDA_MAX_SEQS and GGML_RDA_MAX_TOKENS
+static constexpr int GGML_RDA_MAX_TOKENS_LLAMA = 8; // = GGML_RDA_MAX_TOKENS
+static constexpr int GGML_RDA_P_FLAGS_LLAMA    = 13; // = GGML_RDA_P_FLAGS
+static constexpr int GGML_RDA_F_NO_STATE_WRITE_LLAMA = 1;
+
+bool delta_net::rda_fused_eligible(int il) const {
+    const int mode = raon_rda_fused_mode();
+    if (mode == 0) {
+        return false;
+    }
+    const auto & model   = lctx.model;
+    const auto & hparams = model.hparams;
+    const auto & layer   = model.layers[il];
+    const ggml_tensor * s_l = lctx.kv_self.s_l[il];
+
+    if (!layer.ssm_rda || !layer.ssm_f_b || layer.attn_norm->extra) {
+        return false;
+    }
+    if (save_per_step_states) {
+        // spec verify: only replay-rollback windows; per-step state checkpoints need the unfused delta_net.
+        // RAON_RDA_FUSED_VERIFY=0 keeps verify windows unfused.
+        static const bool fused_verify = [] {
+            const char * e = getenv("RAON_RDA_FUSED_VERIFY");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        if (!fused_verify || !replay_window || !all_same_seq || batch.n_tokens > GGML_RDA_MAX_TOKENS_LLAMA ||
+                replay_layer(il) == nullptr || replay_layer(il)->rda == nullptr) {
+            return false;
+        }
+    } else {
+        // RAON_RDA_FUSED_MAX: max tokens of one sequence to fuse (default 4, up to 8)
+        static const int fused_max = [] {
+            const char * e = getenv("RAON_RDA_FUSED_MAX");
+            const int m = e ? atoi(e) : RAON_RDA_FUSED_MAX_TOKENS;
+            return m < 1 ? 1 : m > GGML_RDA_MAX_TOKENS_LLAMA ? GGML_RDA_MAX_TOKENS_LLAMA : m;
+        }();
+        if (batch.n_tokens > (all_same_seq ? fused_max : RAON_RDA_FUSED_MAX_TOKENS)) {
+            return false;
+        }
+    }
+    if (!all_same_seq && !has_unique_seq_ids) {
+        return false;
+    }
+    if (model.split_mode == LLAMA_SPLIT_MODE_GRAPH || !s_l || s_l->extra || s_l->type != GGML_TYPE_F32 || !s_l->buffer) {
+        return false;
+    }
+
+    const int64_t S  = hparams.ssm_d_state;
+    const int64_t H  = hparams.ssm_dt_rank;
+    const int64_t HS = H*S;
+    if (hparams.ssm_d_conv != 4 || hparams.ssm_n_group != H || hparams.ssm_d_inner != HS) {
+        return false;
+    }
+    for (const ggml_tensor * c : { layer.ssm_conv1d_q, layer.ssm_conv1d_k, layer.ssm_conv1d_v }) {
+        if (c->type != GGML_TYPE_F32 || !ggml_is_contiguous(c) || c->ne[0] != 4 || ggml_nelements(c) != 4*HS || !c->buffer) {
+            return false;
+        }
+    }
+    for (const ggml_tensor * t : { layer.ssm_dt_b, layer.ssm_a, layer.ssm_norm }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+    if (ggml_nelements(layer.ssm_dt_b) != HS || ggml_nelements(layer.ssm_a) != H || layer.ssm_norm->ne[0] != S) {
+        return false;
+    }
+    if (s_l->ne[0] < 3*3*HS + HS*S) {
+        return false;
+    }
+
+    // the op updates s_l in place and is scheduled with the conv weights, so both must share a buffer type
+    const bool state_on_host = ggml_backend_buffer_is_host(s_l->buffer);
+    if (mode == 1 && state_on_host) {
+        return false;
+    }
+    if (ggml_backend_buffer_get_type(layer.ssm_conv1d_q->buffer) != ggml_backend_buffer_get_type(s_l->buffer)) {
+        return false;
+    }
+    return true;
+}
+
+ggml_tensor * delta_net::build_layer_attn_rda_fused(ggml_context * ctx0, ggml_cgraph * gf,
+        ggml_tensor * input, ggml_tensor * inp_out_ids, int il, const llm_build_cb & cb,
+        bool add_residual) const {
+    const auto & model   = lctx.model;
+    const auto & hparams = model.hparams;
+    const auto & layer   = model.layers[il];
+    const int64_t n_tok  = input->ne[1];
+
+    auto cur = llm_build_context::llm_build_norm(ctx0, input, hparams, layer.attn_norm, nullptr, LLM_NORM_RMS, cb, il);
+
+    // projections back to back so CUDA quantizes cur once
+    auto q = llm_build_context::llm_build_lora_mm(lctx, ctx0, layer.wq, cur);
+    auto k = llm_build_context::llm_build_lora_mm(lctx, ctx0, layer.wk, cur);
+    auto v = llm_build_context::llm_build_lora_mm(lctx, ctx0, layer.wv, cur);
+    auto z = llm_build_context::llm_build_lora_mm(lctx, ctx0, layer.ssm_g_a, cur);
+    cb(q, "q", il);
+    cb(k, "k", il);
+    cb(v, "v", il);
+    ggml_build_forward_expand(gf, q);
+    ggml_build_forward_expand(gf, k);
+    ggml_build_forward_expand(gf, v);
+    ggml_build_forward_expand(gf, z);
+    if (layer.ssm_g_b) {
+        z = llm_build_context::llm_build_lora_mm(lctx, ctx0, layer.ssm_g_b, z);
+    }
+    cb(z, "z", il);
+
+    auto beta = llm_build_context::llm_build_lora_mm(lctx, ctx0, layer.ssm_beta, cur);
+    auto rda  = llm_build_context::llm_build_lora_mm(lctx, ctx0, layer.ssm_rda,  cur);
+    auto f    = llm_build_context::llm_build_lora_mm(lctx, ctx0, layer.ssm_f_a,  cur);
+    f = llm_build_context::llm_build_lora_mm(lctx, ctx0, layer.ssm_f_b, f);
+    cb(beta, "beta", il);
+    cb(rda,  "rda_delta", il);
+    cb(f,    "decay_raw", il);
+
+    // one group per sequence
+    int32_t slots[RAON_RDA_FUSED_MAX_TOKENS];
+    bool    reset[RAON_RDA_FUSED_MAX_TOKENS];
+    const int n_seqs = all_same_seq ? 1 : (int) n_tok;
+    for (int g = 0; g < n_seqs; ++g) {
+        slots[g] = (int32_t) token_seq_ids[g];
+        reset[g] = batch.pos != nullptr && batch.pos[g] == 0;
+    }
+
+    // l2 eps 1e-6 as in HF F.normalize
+    auto out = ggml_rda_decode(ctx0, q, k, v,
+            layer.ssm_conv1d_q, layer.ssm_conv1d_k, layer.ssm_conv1d_v,
+            beta, rda, f, layer.ssm_dt_b, layer.ssm_a, z, layer.ssm_norm, lctx.kv_self.s_l[il],
+            n_seqs, slots, reset, hparams.kda_gate_lower_bound, 1e-6f, hparams.f_norm_rms_eps);
+    cb(out, "rda_fused_out", il);
+
+    if (llama_replay_layer * rl = replay_window ? replay_layer(il) : nullptr) {
+        // replay-rollback verify window: leave the slot untouched, save the op inputs for the commit
+        GGML_ASSERT(n_seqs == 1 && !reset[0]);
+        out->op_params[GGML_RDA_P_FLAGS_LLAMA] |= GGML_RDA_F_NO_STATE_WRITE_LLAMA;
+        llama_replay_build_save_fused(ctx0, gf, *rl, out, q, k, v, f, beta, rda);
+    }
+
+    out = llm_build_context::llm_build_lora_mm(lctx, ctx0, layer.ssm_out, out);
+    cb(out, "linear_attn_out", il);
+
+    if (inp_out_ids) {
+        out   = ggml_get_rows(ctx0, out, inp_out_ids);
+        input = ggml_get_rows(ctx0, input, inp_out_ids);
+    }
+    out = add_residual ? ggml_add(ctx0, out, input) : out;
+    cb(out, "ssm_output", il);
+    return out;
+}
+
 ggml_tensor * delta_net::build_layer_attn_kda(ggml_context * ctx0, ggml_cgraph * gf,
         ggml_tensor * cur, ggml_tensor * inp_out_ids, int il, const llm_build_cb & cb,
         bool add_residual) const {
-    GGML_ASSERT(lctx.inp_s_seq_qnext != nullptr);
-
     auto & layer = lctx.model.layers[il];
     GGML_ASSERT(lctx.model.hparams.is_recurrent(il));
     GGML_ASSERT(layer.wq && layer.wk && layer.wv);
     GGML_ASSERT(layer.ssm_conv1d_q && layer.ssm_conv1d_k && layer.ssm_conv1d_v);
     GGML_ASSERT(layer.ssm_f_a && layer.ssm_g_a && layer.ssm_beta);
     GGML_ASSERT(layer.ssm_a && layer.ssm_dt_b && layer.ssm_norm && layer.ssm_out);
+
+    if (rda_fused_eligible(il)) {
+        return build_layer_attn_rda_fused(ctx0, gf, cur, inp_out_ids, il, cb, add_residual);
+    }
+
+    // only created when some layer is not fused
+    GGML_ASSERT(lctx.inp_s_seq_qnext != nullptr);
 
     if (all_same_seq) {
         const bool reset_state = batch.pos != nullptr && batch.pos[0] == 0;

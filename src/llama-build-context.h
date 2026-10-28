@@ -25,6 +25,7 @@ enum llm_ffn_op_type {
     LLM_FFN_RELU_SQR,
     LLM_FFN_SWIGLU,
     LLM_FFN_SWIGLU_OAI,
+    LLM_FFN_SITU,       // Raon-1: beta*tanh(g/beta)*sigmoid(g) * lb*tanh(u/lb), gate parallel
 };
 
 enum llm_ffn_gate_type {
@@ -438,6 +439,8 @@ struct llm_build_context {
     ggml_cgraph * build_bailingmoe3();
     ggml_cgraph * build_glm5next();
 
+    ggml_cgraph * build_raon1();
+
     ggml_cgraph * build_glm5next_mtp();
 
     ggml_cgraph * build_minimaxm2();
@@ -517,6 +520,8 @@ struct llm_build_context {
          const llm_build_cb & cb, int il, ggml_tensor * sinks = nullptr, int n_swa = 0, int kv_il = -1,
          ggml_tensor ** k_cache_view = nullptr, ggml_tensor ** v_cache_view = nullptr,
                     int32_t   swa_head = -1);
+
+    static ggml_tensor * llm_build_situ(ggml_context * ctx, const llama_hparams & hparams, ggml_tensor * gate, ggml_tensor * up);
 
     static ggml_tensor * llm_build_ffn(ggml_context * ctx, llama_context & lctx, ggml_tensor * ffn_norm,
          ggml_tensor * cur,

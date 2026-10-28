@@ -196,6 +196,10 @@ llama_build_and_test(test-chat-template.cpp )
 llama_build_and_test(test-json-partial.cpp )
 llama_build_and_test(test-cpu-affinity.cpp )
 llama_build_and_test(test-nanbeige-loop.cpp )
+llama_build_and_test(test-backend-ops.cpp)
+llama_build_and_test(test-gsample.cpp)
+llama_build_and_test(test-rda-fused.cpp)
+llama_build(test-raon-moe-block.cpp)
 #llama_build_and_test(test-log.cpp)
 llama_build_and_test(
     test-peg-parser.cpp

@@ -8,6 +8,7 @@
 #include <vector>
 #include <climits>
 #include <cstdint>
+#include <algorithm>
 
 using namespace ggml_cuda_mma;
 
@@ -93,6 +94,7 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
         case GGML_TYPE_IQ4_KSS:
         case GGML_TYPE_IQ4_KS:
         case GGML_TYPE_IQ4_KS_R4:
+        case GGML_TYPE_IQ3_KS_R16:
         case GGML_TYPE_IQ4_KS_R16:
         case GGML_TYPE_IQ5_KS_R16:
         case GGML_TYPE_IQ4_K:
@@ -407,6 +409,7 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_IQ4_KSS : return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ4_KS  : return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ4_KS_R4: return MMQ_DP4A_TXS_Q8_0;
+        case GGML_TYPE_IQ3_KS_R16: return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ4_KS_R16: return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ5_KS_R16: return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_IQ4_K   : return MMQ_DP4A_TXS_Q8_0_16;
@@ -479,6 +482,7 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
         case GGML_TYPE_IQ4_KSS : return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_IQ4_KS  : return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_IQ4_KS_R4: return MMQ_MMA_TILE_X_K_Q8_0;
+        case GGML_TYPE_IQ3_KS_R16: return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_IQ4_KS_R16: return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_IQ5_KS_R16: return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_IQ4_K   : return MMQ_MMA_TILE_X_K_Q3_K;
@@ -4148,6 +4152,141 @@ static __global__ void mul_mat_q_stream_k_fixup_id(
     }
 }
 
+// Parallel variant of mul_mat_q_stream_k_fixup_id (mainline #22298): grid = (nblocks, mmq_y/warp_size),
+// block = (warp_size, nwarps/2); each thread owns one row of the tile, so the accumulator stays small.
+template <ggml_type type, int mmq_x, bool need_check>
+__launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device()/2, 1)
+static __global__ void mul_mat_q_stream_k_fixup_id_v2(
+        const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds, float * __restrict__ dst,
+        const float * __restrict__ tmp_last_tile,
+        const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_col_dst,
+        const int nchannels_y, const int stride_channel_dst, const int nsamples_y, const int stride_sample_dst,
+        const int ncols_max) {
+    constexpr int     mmq_y           = get_mmq_y_device();
+    constexpr int     qk              = ggml_cuda_type_traits<type>::qk;
+    constexpr int     blocks_per_iter = MMQ_ITER_K / qk;
+    const     int64_t blocks_per_ne00 = (ncols_x + qk - 1) / qk;
+
+    constexpr int nwarps    = mmq_get_nwarps_device()/2;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    float sum[mmq_x / nwarps] = {0.0f};
+    const int i = blockIdx.y*warp_size + threadIdx.x;
+
+    const int ntx  = (ncols_max + mmq_x - 1) / mmq_x;
+    const int nty  = (nrows_x   + mmq_y - 1) / mmq_y;
+
+    const int bidx0 = blockIdx.x;
+
+    int64_t kbc0      = (int64_t) bidx0     *nsamples_y*nchannels_y*ntx*nty*blocks_per_ne00 / gridDim.x;
+    int64_t kbc0_stop = (int64_t)(bidx0 + 1)*nsamples_y*nchannels_y*ntx*nty*blocks_per_ne00 / gridDim.x;
+
+    kbc0      -= (kbc0      % blocks_per_ne00) % blocks_per_iter;
+    kbc0_stop -= (kbc0_stop % blocks_per_ne00) % blocks_per_iter;
+
+    const bool did_not_have_any_data   = kbc0 == kbc0_stop;
+    const bool wrote_beginning_of_tile = kbc0 % blocks_per_ne00 == 0;
+    const bool did_not_write_last      = kbc0/blocks_per_ne00 == kbc0_stop/blocks_per_ne00 && kbc0_stop % blocks_per_ne00 != 0;
+    if (did_not_have_any_data || wrote_beginning_of_tile || did_not_write_last) {
+        return;
+    }
+
+    bool any_fixup = false;
+
+    int64_t bidx = bidx0 - 1;
+    int64_t kbc_stop = kbc0;
+    while(true) {
+        int64_t kbc = bidx*nsamples_y*nchannels_y*ntx*nty*blocks_per_ne00 / gridDim.x;
+        kbc -= (kbc % blocks_per_ne00) % blocks_per_iter;
+
+        if (kbc == kbc_stop) { // Did not have any data.
+            bidx--;
+            kbc_stop = kbc;
+            continue;
+        }
+
+        any_fixup = true;
+
+#pragma unroll
+        for (int j0 = 0; j0 < mmq_x; j0 += nwarps) {
+            const int j = j0 + threadIdx.y;
+            sum[j0/nwarps] += tmp_last_tile[bidx*(mmq_x*mmq_y) + j*mmq_y + i];
+        }
+
+        if (kbc % blocks_per_ne00 == 0 || kbc/blocks_per_ne00 < kbc0/blocks_per_ne00) {
+            break;
+        }
+        bidx--;
+        kbc_stop = kbc;
+    }
+
+    if (!any_fixup) {
+        return;
+    }
+
+    int64_t tmp = kbc0;
+    const int it = tmp / (nsamples_y*nchannels_y*ntx*blocks_per_ne00);
+    tmp -= it * (nsamples_y*nchannels_y*ntx*blocks_per_ne00);
+    const int wt = tmp / (nchannels_y*ntx*blocks_per_ne00);
+    tmp -= wt * (nchannels_y*ntx*blocks_per_ne00);
+    const int zt = tmp / (ntx*blocks_per_ne00);
+    tmp -= zt * (ntx*blocks_per_ne00);
+    const int jt = tmp / blocks_per_ne00;
+
+    if (!ids_dst) {
+        const int offset_dst = wt*stride_sample_dst + zt*stride_channel_dst + jt*mmq_x*stride_col_dst + it*mmq_y;
+        dst += offset_dst;
+
+        const int i_max = nrows_x   - it*mmq_y - 1;
+        const int j_max = ncols_dst - jt*mmq_x - 1;
+        if (need_check && i > i_max) {
+            return;
+        }
+
+#pragma unroll
+        for (int j0 = 0; j0 < mmq_x; j0 += nwarps) {
+            const int j = j0 + threadIdx.y;
+
+            if (j > j_max) {
+                return;
+            }
+
+            dst[j*stride_col_dst + i] += sum[j0/nwarps];
+        }
+        return;
+    }
+
+    __shared__ int ids_dst_shared[mmq_x];
+    const int col_low  = expert_bounds[zt + 0];
+    const int col_high = expert_bounds[zt + 1];
+    const int col_diff = col_high - col_low;
+
+    for (int j = threadIdx.y*warp_size + threadIdx.x; j < mmq_x; j += nwarps*warp_size) {
+        ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
+    }
+    __syncthreads();
+
+    const int offset_dst = it*mmq_y;
+    dst += offset_dst;
+
+    const int i_max = nrows_x  - it*mmq_y - 1;
+    const int j_max = col_diff - jt*mmq_x - 1;
+    if (need_check && i > i_max) {
+        return;
+    }
+
+#pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += nwarps) {
+        const int j = j0 + threadIdx.y;
+
+        if (j > j_max) {
+            return;
+        }
+
+        dst[ids_dst_shared[j]*stride_col_dst + i] += sum[j0/nwarps];
+    }
+}
+
 struct mmq_args_id {
     const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds; float * dst;
     int64_t ncols_x; int64_t nrows_x; int64_t ncols_dst; int64_t stride_row_x; int64_t ncols_y; int64_t nrows_dst;
@@ -4217,8 +4356,14 @@ static void launch_mul_mat_q_id_impl(ggml_backend_cuda_context & ctx, const mmq_
         return;
     }
 
-    const dim3 block_nums_stream_k(nsm, 1, 1);
-    const bool fixup_needed = ntx*nty*ntzw % nsm != 0;
+    // mainline #22298: one CUDA block per output tile when that tiles the GPU efficiently. For MUL_MAT_ID most
+    // tiles are empty and exit at once, so the scheduler balances the non-empty ones instead of a static k split.
+    const int64_t ntiles_dst = (int64_t) ntx*nty*ntzw;
+    const int nblocks = ggml_cuda_mmq_stream_k_nblocks(cc, nsm, ntiles_dst);
+    const bool v2 = ggml_cuda_mmq_v2_mode() != 0;
+
+    const dim3 block_nums_stream_k(nblocks, 1, 1);
+    const bool fixup_needed = ntiles_dst % nblocks != 0;
 
     ggml_cuda_pool & pool = ctx.pool(id);
     ggml_cuda_pool_alloc<float> tmp_fixup(pool);
@@ -4226,41 +4371,40 @@ static void launch_mul_mat_q_id_impl(ggml_backend_cuda_context & ctx, const mmq_
         tmp_fixup.alloc(block_nums_stream_k.x * mmq_x*mmq_y);
     }
 
+    const dim3 block_nums_fixup_v2(block_nums_stream_k.x, mmq_y/warp_size, 1);
+    const dim3 block_dims_fixup_v2(block_dims.x, block_dims.y/2, block_dims.z);
+
+#define MMQ_ID_LAUNCH_STREAM_K(need_check)                                                                                       \
+    mul_mat_q_id<type, mmq_x, need_check, has_tail><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>                  \
+        (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,                                             \
+         args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,                           \
+         channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,                \
+         sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,                     \
+         args.ncols_max);                                                                                                        \
+    if (!fixup_needed) {                                                                                                         \
+        return;                                                                                                                  \
+    }                                                                                                                            \
+    CUDA_CHECK(cudaGetLastError());                                                                                              \
+    if (v2) {                                                                                                                    \
+        mul_mat_q_stream_k_fixup_id_v2<type, mmq_x, need_check><<<block_nums_fixup_v2, block_dims_fixup_v2, 0, stream>>>        \
+            (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.ncols_x, args.nrows_x, args.ncols_dst,             \
+             args.nrows_dst, args.nchannels_y, args.stride_channel_dst, args.nsamples_y, args.stride_sample_dst,                \
+             args.ncols_max);                                                                                                    \
+    } else {                                                                                                                     \
+        mul_mat_q_stream_k_fixup_id<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, 0, stream>>>                   \
+            (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.ncols_x, args.nrows_x, args.ncols_dst,             \
+             args.nrows_dst, args.nchannels_y, args.stride_channel_dst, args.nsamples_y, args.stride_sample_dst,                \
+             args.ncols_max);                                                                                                    \
+    }
+
     if (args.nrows_x % mmq_y == 0) {
         constexpr bool need_check = false;
-        mul_mat_q_id<type, mmq_x, need_check, has_tail><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
-            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
-             args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
-             channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
-             sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             args.ncols_max);
-
-        if (!fixup_needed) {
-            return;
-        }
-
-        mul_mat_q_stream_k_fixup_id<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, 0, stream>>>
-            (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.ncols_x, args.nrows_x, args.ncols_dst,
-             args.nrows_dst, args.nchannels_y, args.stride_channel_dst, args.nsamples_y, args.stride_sample_dst,
-             args.ncols_max);
+        MMQ_ID_LAUNCH_STREAM_K(need_check);
     } else {
         constexpr bool need_check = true;
-        mul_mat_q_id<type, mmq_x, need_check, has_tail><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
-            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
-             args.ncols_x, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
-             channel_ratio, args.nchannels_y, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
-             sample_ratio, args.nsamples_y, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             args.ncols_max);
-
-        if (!fixup_needed) {
-            return;
-        }
-
-        mul_mat_q_stream_k_fixup_id<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, 0, stream>>>
-            (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.ncols_x, args.nrows_x, args.ncols_dst,
-             args.nrows_dst, args.nchannels_y, args.stride_channel_dst, args.nsamples_y, args.stride_sample_dst,
-             args.ncols_max);
+        MMQ_ID_LAUNCH_STREAM_K(need_check);
     }
+#undef MMQ_ID_LAUNCH_STREAM_K
 }
 
 template <ggml_type type, int mmq_x>
@@ -4288,6 +4432,13 @@ void mul_mat_q_case_id(ggml_backend_cuda_context & ctx, const mmq_args_id & args
     int mmq_x_best  = 0;
     int ntiles_x_best = INT_MAX;
 
+    // GGML_CUDA_MMQ_V2=2 (experimental): for MUL_MAT_ID each expert only sees ncols_dst/nchannels_y columns on
+    // average, so size the tile for that instead of for the total token count (mainline does this on RDNA3/4).
+    int64_t ncols_opt = args.ncols_max;
+    if (args.ids_dst && ggml_cuda_mmq_v2_mode() == 2 && args.nchannels_y > 0) {
+        ncols_opt = std::max<int64_t>(1, (args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y);
+    }
+
     for (int mmq_x = 8; mmq_x <= mmq_x_max && ntiles_x_best > 1; mmq_x += 8) {
         const int granularity = mmq_get_granularity_host(mmq_x, cc);
 
@@ -4295,7 +4446,7 @@ void mul_mat_q_case_id(ggml_backend_cuda_context & ctx, const mmq_args_id & args
             continue;
         }
 
-        const int ntiles_x = (args.ncols_max + mmq_x - 1) / mmq_x;
+        const int ntiles_x = (ncols_opt + mmq_x - 1) / mmq_x;
 
         if (ntiles_x < ntiles_x_best) {
             mmq_x_best = mmq_x;
@@ -4404,6 +4555,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ1_KT);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ2_KT);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ3_KT);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ4_KT);
+extern DECL_MMQ_CASE(GGML_TYPE_IQ3_KS_R16);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ4_KS_R16);
 extern DECL_MMQ_CASE(GGML_TYPE_IQ5_KS_R16);
 

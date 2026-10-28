@@ -1930,6 +1930,14 @@ static void launch_fattn_new_mma(
 
     if (Q->ne[1] ==  1 && n_kv <= 4096 && nsm > 32) nsm /= 2;
     if (Q->ne[1] >= 32 && n_kv >= 4096) nsm *= 2;
+    // RAON_FA_NSM_FULL (default on): one-token decode over more than 4096 KV cells uses every SM for the stream-k
+    // split, not the power of two below the SM count. RAON_FA_NSM=<n> forces the count (testing).
+    {
+        static const bool full   = [] { const char * e = getenv("RAON_FA_NSM_FULL"); return !e || atoi(e) != 0; }();
+        static const int  fa_nsm = [] { const char * e = getenv("RAON_FA_NSM"); return e ? atoi(e) : 0; }();
+        if (full && Q->ne[1] == 1 && n_kv > 4096) nsm = nsm_actual;
+        if (fa_nsm > 0 && Q->ne[1] == 1) nsm = fa_nsm;
+    }
 
     ggml_cuda_pool_alloc<half>   K_f16(pool);
     ggml_cuda_pool_alloc<half>   V_f16(pool);

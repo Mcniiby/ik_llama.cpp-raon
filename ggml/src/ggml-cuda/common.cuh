@@ -20,6 +20,7 @@
 #include "ggml-common.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <array>
 #include <cassert>
 #include <cfloat>
@@ -230,6 +231,28 @@ static bool cp_async_available(const int cc) {
     return cc < CC_OFFSET_AMD && ggml_cuda_highest_compiled_arch(cc) >= CC_AMPERE;
 }
 
+// MMQ scheduling mode, read once from GGML_CUDA_MMQ_V2:
+//   0: ik stream-k scheduling (nsm CUDA blocks + fixup)
+//   1: (default) mainline #22298: one block per output tile when the tile wave efficiency is >= 90%, else stream-k
+//   2: as 1, with the MoE tile width chosen from the mean tokens per expert (experimental)
+static int ggml_cuda_mmq_v2_mode() {
+    static const int mode = [] {
+        const char * env = getenv("GGML_CUDA_MMQ_V2");
+        return env ? atoi(env) : 1;
+    }();
+    return mode;
+}
+
+// Number of CUDA blocks for a stream-k MMQ launch with ntiles output tiles (mainline #22298).
+static int ggml_cuda_mmq_stream_k_nblocks(const int cc, const int nsm, const int64_t ntiles) {
+    if (ggml_cuda_mmq_v2_mode() == 0 || !GGML_CUDA_CC_IS_NVIDIA(cc) || ntiles <= 0 || ntiles > INT32_MAX) {
+        return nsm;
+    }
+    const int64_t nwaves = (ntiles + nsm - 1) / nsm;
+    const int64_t efficiency_percent = 100 * ntiles / (nsm*nwaves);
+    return efficiency_percent >= 90 ? (int) ntiles : nsm;
+}
+
 [[noreturn]]
 static __device__ void no_device_code(
     const char * file_name, const int line, const char * function_name, const int arch, const char * arch_list) {
@@ -257,6 +280,12 @@ static __device__ __forceinline__ void ggml_cuda_syncwarp() {
 #ifndef GGML_USE_HIP
     __syncwarp();
 #endif // GGML_USE_HIP
+}
+
+// SiTU gated activation: beta*tanh(g/beta)*sigmoid(g) * (lb > 0 ? lb*tanh(u/lb) : u)
+static __device__ __forceinline__ float ggml_cuda_situ(float g, float u, const float beta, const float lb) {
+    const float a = beta*tanhf(g*(1.0f/beta)) * (1.0f/(1.0f + expf(-g)));
+    return a * (lb > 0.0f ? lb*tanhf(u*(1.0f/lb)) : u);
 }
 
 static __device__ __forceinline__ float warp_reduce_sum(float x) {

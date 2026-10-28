@@ -4859,10 +4859,19 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
         return;
     }
 
-    const dim3 block_nums_mmq(nsm, 1, 1);
+    // mainline #22298: one CUDA block per output tile when that tiles the GPU efficiently; the fixup
+    // pass is then unnecessary. GGML_CUDA_MMQ_V2=0 keeps nsm blocks and always runs the fixup.
+    const int64_t ntiles_dst = (int64_t) ntx*nty;
+    const int nblocks = ggml_cuda_mmq_stream_k_nblocks(cc, nsm, ntiles_dst);
+    const bool fixup_needed = ggml_cuda_mmq_v2_mode() == 0 || ntiles_dst % nblocks != 0;
+
+    const dim3 block_nums_mmq(nblocks, 1, 1);
 
     ggml_cuda_pool & pool = ctx.pool(id);
-    ggml_cuda_pool_alloc<float> tmp_fixup(pool, block_nums_mmq.x * mmq_x*mmq_y);
+    ggml_cuda_pool_alloc<float> tmp_fixup(pool);
+    if (fixup_needed) {
+        tmp_fixup.alloc(block_nums_mmq.x * mmq_x*mmq_y);
+    }
 
     if (args.ne01 % mmq_y == 0) {
         constexpr bool need_check = false;
@@ -4870,8 +4879,10 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
         mul_mat_q<type, mmq_x, MMQ_NWARPS, need_check, has_tail><<<block_nums_mmq, block_dims, shmem, stream>>>
             (args.x, args.y, args.dst, tmp_fixup.ptr, args.ne00, args.ne01, args.stride01, args.ne10, args.ne11, args.stride11, args.ne0);
 
-        mul_mat_q_stream_k_fixup<type, mmq_x, MMQ_NWARPS, need_check><<<block_nums_xy_tiling, block_dims, 0, stream>>>
-            (args.dst, tmp_fixup.ptr, args.ne00, args.ne01, args.ne11, args.ne0, block_nums_mmq.x);
+        if (fixup_needed) {
+            mul_mat_q_stream_k_fixup<type, mmq_x, MMQ_NWARPS, need_check><<<block_nums_xy_tiling, block_dims, 0, stream>>>
+                (args.dst, tmp_fixup.ptr, args.ne00, args.ne01, args.ne11, args.ne0, block_nums_mmq.x);
+        }
 
     } else {
         constexpr bool need_check = true;
@@ -4879,9 +4890,10 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
         mul_mat_q<type, mmq_x, MMQ_NWARPS, need_check, has_tail><<<block_nums_mmq, block_dims, shmem, stream>>>
             (args.x, args.y, args.dst, tmp_fixup.ptr, args.ne00, args.ne01, args.stride01, args.ne10, args.ne11, args.stride11, args.ne0);
 
-        mul_mat_q_stream_k_fixup<type, mmq_x, MMQ_NWARPS, need_check><<<block_nums_xy_tiling, block_dims, 0, stream>>>
-            (args.dst, tmp_fixup.ptr, args.ne00, args.ne01, args.ne11, args.ne0, block_nums_mmq.x);
-
+        if (fixup_needed) {
+            mul_mat_q_stream_k_fixup<type, mmq_x, MMQ_NWARPS, need_check><<<block_nums_xy_tiling, block_dims, 0, stream>>>
+                (args.dst, tmp_fixup.ptr, args.ne00, args.ne01, args.ne11, args.ne0, block_nums_mmq.x);
+        }
     }
 }
 

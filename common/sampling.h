@@ -252,6 +252,7 @@ struct common_sampler {
     // TODO: replace with ring-buffer
     std::vector<llama_token>      prev;
     std::vector<llama_token_data> cur;
+    std::vector<llama_token_data> topk_work; // scratch for the exact top-k path
     llama_sampler_dry* smpl;
 
     llama_sampler_adaptive_p * adapt_p_ctx;    // adaptive p sampler

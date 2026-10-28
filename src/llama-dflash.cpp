@@ -502,7 +502,14 @@ bool llama_prepare_dflash_graph_inputs(
         lctx.dflash.kv.cache_compute_meta.resize(meta_size);
     }
 
-    if (lctx.dflash.kv.cache_sched == nullptr || lctx.dflash.kv.cache_reserved_rows != cross_ctx) {
+    // the K/V update is per row, so large updates run in chunks of kv_chunk rows to bound the compute buffer.
+    // LLAMA_DFLASH_KV_CHUNK=0: one pass over the whole update
+    static const int32_t kv_chunk_env = [] {
+        const char * e = getenv("LLAMA_DFLASH_KV_CHUNK");
+        return e ? atoi(e) : 128;
+    }();
+    const int32_t kv_chunk = kv_chunk_env > 0 ? std::min(kv_chunk_env, cross_ctx) : cross_ctx;
+    if (lctx.dflash.kv.cache_sched == nullptr || lctx.dflash.kv.cache_reserved_rows != kv_chunk) {
         std::vector<ggml_backend_buffer_type_t> backend_buft;
         backend_buft.reserve(lctx.backends.size());
         for (auto * backend : lctx.backends) {
@@ -522,7 +529,7 @@ bool llama_prepare_dflash_graph_inputs(
         lctx.dflash.kv.cache_graph_write_pos = 0;
 
         const int32_t saved_update_rows = lctx.dflash.kv.cache_update_rows;
-        lctx.dflash.kv.cache_update_rows = cross_ctx;
+        lctx.dflash.kv.cache_update_rows = kv_chunk;
         ggml_cgraph * gf_reserve = llm_build_context::llama_build_graph_dflash_kv_cache(lctx);
         lctx.dflash.kv.cache_update_rows = saved_update_rows;
         if (gf_reserve == nullptr) {
@@ -536,7 +543,7 @@ bool llama_prepare_dflash_graph_inputs(
             LLAMA_LOG_ERROR("%s: failed to initialize DFlash K/V scheduler\n", __func__);
             return false;
         }
-        lctx.dflash.kv.cache_reserved_rows = cross_ctx;
+        lctx.dflash.kv.cache_reserved_rows = kv_chunk;
     }
 
     if (update_rows > 0) {
@@ -558,11 +565,15 @@ bool llama_prepare_dflash_graph_inputs(
             llama_reset_dflash_kv_cache_state(&lctx);
         }
 
+      for (int32_t chunk0 = 0; chunk0 < update_rows; chunk0 += kv_chunk) {
+        const int32_t chunk_rows = std::min(kv_chunk, update_rows - chunk0);
+        const float * chunk_src = update_src + (size_t) chunk0 * (size_t) width;
+        const llama_pos * chunk_pos = update_pos + chunk0;
         const int32_t cache_write_start = lctx.dflash.kv.cache_write_pos;
-        lctx.dflash.kv.cache_update_rows = update_rows;
+        lctx.dflash.kv.cache_update_rows = chunk_rows;
         ggml_cgraph * gf_kv = nullptr;
         const bool can_reuse_kv_graph = lctx.dflash.kv.cache_graph != nullptr &&
-                lctx.dflash.kv.cache_graph_rows == update_rows &&
+                lctx.dflash.kv.cache_graph_rows == chunk_rows &&
                 (lctx.model.hparams.dflash_dsv4 ||
                  lctx.dflash.kv.cache_graph_write_pos == lctx.dflash.kv.cache_write_pos);
         if (can_reuse_kv_graph) {
@@ -580,26 +591,26 @@ bool llama_prepare_dflash_graph_inputs(
             ggml_backend_sched_alloc_graph(lctx.dflash.kv.cache_sched, gf_kv);
 
             lctx.dflash.kv.cache_graph = gf_kv;
-            lctx.dflash.kv.cache_graph_rows = update_rows;
+            lctx.dflash.kv.cache_graph_rows = chunk_rows;
             lctx.dflash.kv.cache_graph_write_pos = lctx.dflash.kv.cache_write_pos;
         }
 
         ggml_backend_t kv_feature_backend = llama_backend_for_tensor(lctx, lctx.dflash.kv.cache_input_target_features);
         if (kv_feature_backend != nullptr) {
-            ggml_backend_tensor_set_async(kv_feature_backend, lctx.dflash.kv.cache_input_target_features, update_src, 0, ggml_nbytes(lctx.dflash.kv.cache_input_target_features));
+            ggml_backend_tensor_set_async(kv_feature_backend, lctx.dflash.kv.cache_input_target_features, chunk_src, 0, ggml_nbytes(lctx.dflash.kv.cache_input_target_features));
         } else {
-            ggml_backend_tensor_set(lctx.dflash.kv.cache_input_target_features, update_src, 0, ggml_nbytes(lctx.dflash.kv.cache_input_target_features));
+            ggml_backend_tensor_set(lctx.dflash.kv.cache_input_target_features, chunk_src, 0, ggml_nbytes(lctx.dflash.kv.cache_input_target_features));
         }
 
         ggml_backend_t kv_pos_backend = llama_backend_for_tensor(lctx, lctx.dflash.kv.cache_input_pos_ctx);
         if (kv_pos_backend != nullptr) {
-            ggml_backend_tensor_set_async(kv_pos_backend, lctx.dflash.kv.cache_input_pos_ctx, update_pos, 0, ggml_nbytes(lctx.dflash.kv.cache_input_pos_ctx));
+            ggml_backend_tensor_set_async(kv_pos_backend, lctx.dflash.kv.cache_input_pos_ctx, chunk_pos, 0, ggml_nbytes(lctx.dflash.kv.cache_input_pos_ctx));
         } else {
-            ggml_backend_tensor_set(lctx.dflash.kv.cache_input_pos_ctx, update_pos, 0, ggml_nbytes(lctx.dflash.kv.cache_input_pos_ctx));
+            ggml_backend_tensor_set(lctx.dflash.kv.cache_input_pos_ctx, chunk_pos, 0, ggml_nbytes(lctx.dflash.kv.cache_input_pos_ctx));
         }
         if (lctx.model.hparams.dflash_dsv4) {
-            std::vector<int32_t> update_rows_idx((size_t) update_rows);
-            for (int32_t i = 0; i < update_rows; ++i) {
+            std::vector<int32_t> update_rows_idx((size_t) chunk_rows);
+            for (int32_t i = 0; i < chunk_rows; ++i) {
                 update_rows_idx[(size_t) i] = (cache_write_start + i) % cross_ctx;
             }
             ggml_backend_t kv_rows_backend = llama_backend_for_tensor(lctx, lctx.dflash.kv.cache_input_rows);
@@ -620,19 +631,37 @@ bool llama_prepare_dflash_graph_inputs(
         if ((int32_t) lctx.dflash.kv.cache_slot_valid.size() != cross_ctx) {
             lctx.dflash.kv.cache_slot_valid.assign((size_t) cross_ctx, 0);
         }
-        for (int32_t i = 0; i < update_rows; ++i) {
+        for (int32_t i = 0; i < chunk_rows; ++i) {
             const int32_t slot = (cache_write_start + i) % cross_ctx;
-            lctx.dflash.kv.cache_pos[(size_t) slot] = update_pos[i];
+            lctx.dflash.kv.cache_pos[(size_t) slot] = chunk_pos[i];
             lctx.dflash.kv.cache_slot_valid[(size_t) slot] = 1;
         }
 
-        lctx.dflash.kv.cache_n_filled = std::min(cross_ctx, lctx.dflash.kv.cache_n_filled + update_rows);
-        lctx.dflash.kv.cache_write_pos = (lctx.dflash.kv.cache_write_pos + update_rows) % cross_ctx;
+        lctx.dflash.kv.cache_n_filled = std::min(cross_ctx, lctx.dflash.kv.cache_n_filled + chunk_rows);
+        lctx.dflash.kv.cache_write_pos = (lctx.dflash.kv.cache_write_pos + chunk_rows) % cross_ctx;
         lctx.dflash.kv.cache_applied_window_version = lctx.dflash.target.version;
         lctx.dflash.kv.cache_valid = true;
         lctx.dflash.kv.cache_view_n_filled = lctx.dflash.kv.cache_n_filled;
         lctx.dflash.kv.cache_view_write_pos = lctx.dflash.kv.cache_write_pos;
         lctx.dflash.kv.cache_view_valid = true;
+      }
+        // LLAMA_DFLASH_KV_HASH=1: print a hash of the cross-context K/V after each update
+        static const bool kv_hash = [] { const char * e = getenv("LLAMA_DFLASH_KV_HASH"); return e && atoi(e) != 0; }();
+        if (kv_hash) {
+            uint64_t h = 1469598103934665603ull;
+            std::vector<uint8_t> tmp;
+            for (size_t il = 0; il < lctx.dflash.kv.k_ctx_cache.size(); ++il) {
+                for (ggml_tensor * t : { lctx.dflash.kv.k_ctx_cache[il], lctx.dflash.kv.v_ctx_cache[il] }) {
+                    if (t == nullptr) continue;
+                    tmp.resize(ggml_nbytes(t));
+                    ggml_backend_tensor_get(t, tmp.data(), 0, tmp.size());
+                    for (uint8_t b : tmp) { h ^= b; h *= 1099511628211ull; }
+                }
+            }
+            LLAMA_LOG_INFO("dflash_kv_hash: update_rows=%d rebuild=%d n_filled=%d write_pos=%d hash=%016llx\n",
+                    update_rows, (int) cache_plan.rebuild_cache, lctx.dflash.kv.cache_n_filled, lctx.dflash.kv.cache_write_pos,
+                    (unsigned long long) h);
+        }
     }
 
     if ((int32_t) lctx.dflash.kv.cache_pos.size() != cross_ctx ||
